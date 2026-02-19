@@ -76,7 +76,12 @@ except ImportError:
 # --- Bot Configuration ---
 BOT_TOKEN = "7956452112:AAGSZVLZz34ep8qCsLKnTRZambI67r_T3ro"
 HELPER_BOT_TOKEN = "8524914117:AAE1zTiTBm2npMdVguapC0HYbjFdaM56yyY"  # Add your second bot token here for load balancing PvP games in groups
-BOT_OWNER_ID = 6083286836
+BOT_OWNER_IDS = [6083286836]  # List of admin Telegram IDs. First ID receives withdrawal notifications.
+BOT_OWNER_ID = BOT_OWNER_IDS[0]  # Primary admin (backward compat for withdrawal notifications)
+
+def is_admin(user_id: int) -> bool:
+    """Check if a user is a bot admin/owner."""
+    return user_id in BOT_OWNER_IDS
 MIN_BALANCE = 0.1
 DEBUG_EMOJI_GAMES = False  # Set to True to enable detailed emoji game logging
 
@@ -4116,7 +4121,7 @@ def check_banned(func):
 def check_maintenance(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
-        if bot_settings.get("maintenance_mode", False) and user.id != BOT_OWNER_ID:
+        if bot_settings.get("maintenance_mode", False) and not is_admin(user.id):
             user_lang = get_user_lang(user.id) if user else DEFAULT_LANG
             
             # Allow ongoing game interactions to continue
@@ -4547,6 +4552,9 @@ async def send_insufficient_balance_message(update: Update, message: str = None,
     
     if message is None:
         message = get_text("insufficient_balance", user_lang)
+    
+    # Add currency change hint
+    message += "\n(or please change the currency from settings.)"
     
     if update.callback_query:
         await safe_edit_message(update.callback_query, message, parse_mode=ParseMode.HTML)
@@ -5073,7 +5081,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_group = update.effective_chat.type in ["group", "supergroup"]
     
     if is_group:
-        # Group chat: show template image with Deposit/Withdraw link buttons only
+        # Group chat: simplified balance display with Deposit/Withdraw link buttons, NO template image
         bot_username = (await context.bot.get_me()).username
         keyboard = [
             [
@@ -5082,35 +5090,20 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ]
         
+        # Simplified balance: Balance: $X (X' COIN)
+        active_coin = get_active_currency(user.id)
+        balance_usd = get_active_balance_usd(user.id)
+        wallet = ensure_wallet_dict(user.id)
+        crypto_balance = wallet.get(active_coin, 0.0)
+        formatted_crypto = format_crypto_amount(crypto_balance, active_coin)
+        
         welcome_text = (
-            "🐱 <b>Welcome to Casino ⚡</b>\n\n"
-            "⭐️ Casino - the best online mini-games platform on Telegram\n"
-            f"💵 <b>Balance:</b> {formatted_balance}\n"
-            f"👑 <b>Wagers:</b> {formatted_wagers}\n\n"
-            "🎮 Choose an option below to get started!"
+            f"💵 <b>Balance:</b> ${balance_usd:,.2f} ({formatted_crypto} {active_coin})"
         )
         
         reply_markup = create_styled_keyboard(keyboard)
         
-        dashboard_image = await generate_dashboard_image(user.id, context)
-        if dashboard_image and update.message:
-            try:
-                sent_message = await update.message.reply_photo(
-                    photo=dashboard_image,
-                    caption=welcome_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-                set_menu_owner(sent_message, user.id)
-            except Exception as e:
-                logging.error(f"Error sending dashboard image in group: {e}")
-                sent_message = await update.message.reply_text(
-                    welcome_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-                set_menu_owner(sent_message, user.id)
-        elif update.message:
+        if update.message:
             sent_message = await update.message.reply_text(
                 welcome_text,
                 parse_mode=ParseMode.HTML,
@@ -5140,7 +5133,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([apply_button_style(InlineKeyboardButton("⚙️ Settings", callback_data="main_settings"), 'success')])  # GREEN
 
     # Row 5: Admin Dashboard (only for admin)
-    if user.id == BOT_OWNER_ID:
+    if is_admin(user.id):
         keyboard.append([InlineKeyboardButton(get_text("admin_panel", user_lang), callback_data="admin_dashboard").to_dict()])
 
     # Get total wagers for display
@@ -5377,13 +5370,14 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         dashboard_image = await generate_dashboard_image(user.id, context)
         if dashboard_image:
             try:
-                await context.bot.send_photo(
+                sent_msg = await context.bot.send_photo(
                     chat_id=query.message.chat_id,
                     photo=dashboard_image,
                     caption=wallet_text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
+                set_menu_owner(sent_msg, user.id)
                 # Delete the old message
                 try:
                     await query.message.delete()
@@ -5548,7 +5542,7 @@ async def start_command_inline(query, context):
         keyboard.append([apply_button_style(InlineKeyboardButton("⚙️ Settings", callback_data="main_settings"), 'success')])  # GREEN
 
     # Row 5: Admin Dashboard (only for admin)
-    if user.id == BOT_OWNER_ID:
+    if is_admin(user.id):
         keyboard.append([InlineKeyboardButton("🔧 Admin Panel", callback_data="admin_dashboard").to_dict()])
 
     # Create links row - Only show in DMs to avoid spam in groups
@@ -6145,6 +6139,8 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "blackjack",
         "user_id": user.id,
         "bet_amount": bet_amount_usd,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount_usd / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "bet_amount_currency": bet_amount_currency,
         "currency": currency,
         "status": "active",
@@ -6483,6 +6479,8 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "coin_flip",
         "user_id": user.id,
         "bet_amount": bet,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "active",
         "timestamp": str(datetime.now(timezone.utc)),
         "streak": 0,
@@ -6680,6 +6678,8 @@ async def coinflip_rebet_double_callback(update: Update, context: ContextTypes.D
         "game_type": "coin_flip",
         "user_id": user.id,
         "bet_amount": bet,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "active",
         "timestamp": str(datetime.now(timezone.utc)),
         "streak": 0,
@@ -6822,6 +6822,8 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "highlow",
         "user_id": user.id,
         "bet_amount": bet,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "active",
         "timestamp": str(datetime.now(timezone.utc)),
         "streak": 0,
@@ -7194,6 +7196,8 @@ async def highlow_rebet_double_callback(update: Update, context: ContextTypes.DE
         "game_type": "highlow",
         "user_id": user.id,
         "bet_amount": bet,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "active",
         "timestamp": str(datetime.now(timezone.utc)),
         "streak": 0,
@@ -7497,6 +7501,8 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_sessions[game_id] = {
         "id": game_id, "game_type": "roulette", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": multiplier, "choice": choice, "result": winning_number,
         "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
     }
@@ -7642,6 +7648,8 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         game_sessions[game_id] = {
             "id": game_id, "game_type": "roulette", "user_id": user.id,
             "bet_amount": rebet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+            "active_currency": get_active_currency(user.id),
+            "crypto_bet_amount": rebet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
             "win": win, "multiplier": multiplier, "choice": rebet_choice, "result": winning_number,
             "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
             "choice_numbers": rebet_numbers
@@ -7914,6 +7922,8 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_sessions[game_id] = {
         "id": game_id, "game_type": "roulette", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": multiplier, "choice": choice, "result": winning_number,
         "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
         "choice_numbers": choice_numbers  # Store for rebet
@@ -8030,6 +8040,8 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_sessions[game_id] = {
         "id": game_id, "game_type": "dice_roll", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": multiplier, "choice": choice, "result": dice_result
     }
     update_pnl(user.id)
@@ -8473,6 +8485,8 @@ async def start_tower_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "tower",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "difficulty": difficulty,
         "tiles_per_floor": tiles_per_floor,
         "status": "active",
@@ -8790,6 +8804,8 @@ async def tower_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         "game_type": "tower",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "difficulty": difficulty,
         "tiles_per_floor": tiles_per_floor,
         "status": "active",
@@ -8905,6 +8921,8 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_sessions[game_id] = {
         "id": game_id, "game_type": "slots", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": multiplier, "result": slot_value,
         "server_seed": server_seed, "client_seed": client_seed, "nonce": nonce
     }
@@ -9020,6 +9038,8 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
     game_sessions[game_id] = {
         "id": game_id, "game_type": "slots", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": multiplier, "result": slot_value,
         "server_seed": server_seed, "client_seed": client_seed, "nonce": nonce
     }
@@ -9769,6 +9789,8 @@ async def play_single_emoji_game(update: Update, context: ContextTypes.DEFAULT_T
         "game_type": f"single_emoji_{game_key}",
         "user_id": user.id,
         "bet_amount": bet_amount_usd,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount_usd / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "completed",
         "timestamp": str(datetime.now(timezone.utc)),
         "win": won,
@@ -10232,6 +10254,8 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     game_sessions[game_id] = {
         "id": game_id, "game_type": f"pvb_{game_type}", "user_id": user.id,
         "bet_amount": bet_amount, "status": "active", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "target_score": target_score, "current_round": 1,
         "user_score": 0, "bot_score": 0, 
         "bot_rolls": [],
@@ -10383,6 +10407,8 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_sessions[game_id] = {
         "id": game_id, "game_type": "predict", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "win": win, "multiplier": 2 if win else 0, "choice": direction, "result": outcome
     }
     update_pnl(user.id)
@@ -10506,6 +10532,8 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "limbo",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "target_multiplier": target_multiplier,
         "outcome": outcome,
         "status": "completed",
@@ -10633,6 +10661,8 @@ async def keno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "keno",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "selected_numbers": [],
         "status": "selecting",
         "timestamp": str(datetime.now(timezone.utc))
@@ -10937,6 +10967,8 @@ async def keno_rebet_double_callback(update: Update, context: ContextTypes.DEFAU
         "game_type": "keno",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "selected_numbers": selected_numbers,
         "drawn_numbers": drawn_numbers,
         "matches": matches,
@@ -11109,6 +11141,8 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "crash",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "crash_point": crash_point,
         "auto_cashout": auto_cashout,
         "status": "completed",
@@ -11196,6 +11230,8 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "plinko",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "risk": risk,
         "result_index": result_index,
         "multiplier": multiplier,
@@ -11293,6 +11329,8 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "game_type": "wheel",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "segment": segment,
         "multiplier": multiplier,
         "status": "completed",
@@ -11455,6 +11493,8 @@ async def coinchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "user_id": user.id,
         "game_type": "coin_chain",
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "chain_length": 0,
         "current_multiplier": 1.0,
         "status": "active"
@@ -11668,6 +11708,8 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_id = generate_unique_id("MN")
     game_sessions[game_id] = {
         "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
         "picks": [], "total_cells": total_cells, "num_mines": num_mines,
         "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
@@ -12032,6 +12074,8 @@ async def mines_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         "game_type": "mines",
         "user_id": user.id,
         "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "num_mines": num_mines,
         "total_cells": total_cells,
         "mines": mines,
@@ -12061,7 +12105,7 @@ async def mines_rebet_double_callback(update: Update, context: ContextTypes.DEFA
 # --- /cancelall command (owner only, cancels all matches and notifies users) ---
 async def cancel_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -12086,7 +12130,7 @@ async def cancel_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # --- STOP/RESUME/CANCEL ALL HANDLERS ---
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -12102,7 +12146,7 @@ async def stop_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await query.answer("Only the owner can confirm stop.", show_alert=True)
         return
     if query.data == "stop_confirm_yes":
@@ -12114,7 +12158,7 @@ async def stop_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global bot_stopped
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -12420,7 +12464,7 @@ async def limits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- USERS (OWNER-ONLY) COMMAND ---
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -12478,7 +12522,7 @@ async def send_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def users_navigation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is an admin-only button.", show_alert=True)
         return
 
@@ -12761,7 +12805,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_group = update.effective_chat.type in ["group", "supergroup"]
     
     if is_group:
-        # Group chat: same as /start - template image with deposit/withdraw link buttons
+        # Group chat: simplified balance display with Deposit/Withdraw link buttons, NO template image
         bot_username = (await context.bot.get_me()).username
         keyboard = [
             [
@@ -12770,41 +12814,25 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
         ]
         
+        # Simplified balance: Balance: $X (X' COIN)
+        active_coin = get_active_currency(user.id)
+        balance_usd = get_active_balance_usd(user.id)
+        wallet = ensure_wallet_dict(user.id)
+        crypto_balance = wallet.get(active_coin, 0.0)
+        formatted_crypto = format_crypto_amount(crypto_balance, active_coin)
+        
         text = (
-            "🐱 <b>Welcome to Casino ⚡</b>\n\n"
-            "⭐️ Casino - the best online mini-games platform on Telegram\n"
-            f"💵 <b>Balance:</b> {formatted_balance}\n"
-            f"👑 <b>Wagers:</b> {formatted_wagers}\n\n"
-            "🎮 Choose an option below to get started!"
+            f"💵 <b>Balance:</b> ${balance_usd:,.2f} ({formatted_crypto} {active_coin})"
         )
         
         reply_markup = create_styled_keyboard(keyboard)
         
-        dashboard_image = await generate_dashboard_image(user.id, context)
-        if dashboard_image:
-            try:
-                sent_message = await update.message.reply_photo(
-                    photo=dashboard_image,
-                    caption=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-                set_menu_owner(sent_message, user.id)
-            except Exception as e:
-                logging.error(f"Error sending dashboard image in group: {e}")
-                sent_message = await update.message.reply_text(
-                    text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup
-                )
-                set_menu_owner(sent_message, user.id)
-        else:
-            sent_message = await update.message.reply_text(
-                text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup
-            )
-            set_menu_owner(sent_message, user.id)
+        sent_message = await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup
+        )
+        set_menu_owner(sent_message, user.id)
         return
     
     # DM: original behavior
@@ -12869,8 +12897,11 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fr
         msg += "⏳ <b>Your Pending/Active Games:</b>\n\n"
         for game in pending_games:
             game_type = game['game_type'].replace('_', ' ').title()
+            coin = game.get('active_currency', 'USDT')
+            crypto_bet = game.get('crypto_bet_amount', game['bet_amount'])
+            formatted_crypto = format_crypto_amount(crypto_bet, coin)
             msg += (f"<b>Game:</b> {game_type} | <b>ID:</b> <code>{game['id']}</code>\n"
-                    f"<b>Bet:</b> ${game['bet_amount']:.2f} | <b>Status:</b> {game['status'].capitalize()}\n"
+                    f"<b>Bet:</b> ${game['bet_amount']:.2f} ({formatted_crypto} {coin}) | <b>Status:</b> {game['status'].capitalize()}\n"
                     f"Use <code>/continue {game['id']}</code> to resume.\n"
                     "--------------------\n")
 
@@ -12886,6 +12917,9 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fr
 
     for game in paginated_completed:
         game_type = game['game_type'].replace('_', ' ').title()
+        coin = game.get('active_currency', 'USDT')
+        crypto_bet = game.get('crypto_bet_amount', game['bet_amount'])
+        formatted_crypto = format_crypto_amount(crypto_bet, coin)
         msg += f"<b>Game:</b> {game_type} | <b>ID:</b> <code>{game['id']}</code>\n"
 
         # Determine win/loss/push status text
@@ -12896,7 +12930,7 @@ async def matches_command(update: Update, context: ContextTypes.DEFAULT_TYPE, fr
         else: # Covers push (None) or other statuses
             win_status = game['status'].capitalize()
 
-        msg += f"<b>Bet:</b> ${game['bet_amount']:.2f} | <b>Result:</b> {win_status}\n"
+        msg += f"<b>Bet:</b> ${game['bet_amount']:.2f} ({formatted_crypto} {coin}) | <b>Result:</b> {win_status}\n"
 
         # Add game-specific details
         if game['game_type'] == 'blackjack':
@@ -12988,7 +13022,7 @@ async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
 
 # --- OWNER HISTORY COMMANDS ---
 async def he_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return
+    if not is_admin(update.effective_user.id): return
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
     all_deal_files = [f for f in os.listdir(ESCROW_DIR) if f.endswith('.json')]
     if not all_deal_files:
@@ -13010,7 +13044,7 @@ async def he_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def hc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return
+    if not is_admin(update.effective_user.id): return
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
 
     all_games = sorted(game_sessions.values(), key=lambda x: x.get("timestamp", ""), reverse=True)
@@ -13648,7 +13682,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Clear user funds (owner only) ---
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the bot owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -13657,7 +13691,7 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clearall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("Only the bot owner can use this command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -13669,7 +13703,7 @@ async def clear_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user = query.from_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await query.answer("Only the owner can confirm this action.", show_alert=True)
         return
 
@@ -13767,7 +13801,7 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Could not find the target user.")
         return
 
-    is_owner = user.id == BOT_OWNER_ID
+    is_owner = is_admin(user.id)
     if user.id == target_user_id and not is_owner:
         await update.message.reply_text("You cannot tip yourself.")
         return
@@ -13820,14 +13854,15 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle tip confirmation/cancellation inline buttons."""
     query = update.callback_query
-    await query.answer()
     user = query.from_user
     data = query.data
 
     pending_tip = context.user_data.get('pending_tip')
     if not pending_tip or pending_tip['sender_id'] != user.id:
-        await query.edit_message_text("❌ This tip confirmation has expired or is not for you.")
+        await query.answer("This menu is not for you.", show_alert=True)
         return
+    
+    await query.answer()
 
     if data.startswith("cancel_tip_"):
         context.user_data.pop('pending_tip', None)
@@ -13888,7 +13923,7 @@ async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback=False):
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
-    is_owner = user.id == BOT_OWNER_ID
+    is_owner = is_admin(user.id)
     
     # Set menu owner for group protection when called as command
     if not from_callback:
@@ -14040,7 +14075,7 @@ async def cashout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await coin_flip_callback(fake_update, context)
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID:
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("Only the bot owner can use this command.")
         return
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
@@ -14772,7 +14807,7 @@ async def escrow_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     
     # Check if user is owner
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This command is only available to the bot owner.")
         return
     
@@ -15307,7 +15342,7 @@ async def level_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This is an owner-only command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -15743,7 +15778,7 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ## NEW FEATURE - Admin Dashboard & Group Settings ##
 async def admin_dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
@@ -15784,7 +15819,7 @@ async def admin_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
     ]
 
     if query:
-        if query.from_user.id != BOT_OWNER_ID: return
+        if not is_admin(query.from_user.id): return
         await query.answer()
         await safe_edit_message(query, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -15792,7 +15827,7 @@ async def admin_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
 
 async def admin_bot_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID: return
+    if not is_admin(query.from_user.id): return
     await query.answer()
 
     text = "⚙️ <b>Bot Settings</b>"
@@ -15806,7 +15841,7 @@ async def admin_bot_settings_callback(update: Update, context: ContextTypes.DEFA
 
 async def admin_actions_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is an admin-only area.", show_alert=True)
         return
 
@@ -16016,7 +16051,7 @@ async def admin_export_data_callback(update: Update, context: ContextTypes.DEFAU
 
 
 async def set_house_balance_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     try:
         amount = float(update.message.text)
         if amount < 0: raise ValueError
@@ -16033,7 +16068,7 @@ async def set_house_balance_step(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_limits_choose_type_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(query.from_user.id): return ConversationHandler.END
     await query.answer()
 
     limit_type = query.data.split('_')[-1] # min or max
@@ -16065,7 +16100,7 @@ async def admin_limits_choose_type_step(update: Update, context: ContextTypes.DE
 
 async def admin_limits_choose_game_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(query.from_user.id): return ConversationHandler.END
     await query.answer()
 
     # Fixed: Extract game name properly (format: admin_limit_game_{game_name})
@@ -16079,7 +16114,7 @@ async def admin_limits_choose_game_step(update: Update, context: ContextTypes.DE
     return ADMIN_LIMITS_SET_AMOUNT
 
 async def admin_limits_set_amount_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
 
     try:
         amount = float(update.message.text)
@@ -16144,7 +16179,7 @@ async def broadcast_win_to_channel(context: ContextTypes.DEFAULT_TYPE, user_id: 
         logging.error(f"Failed to broadcast win to channel: {e}")
 
 async def set_daily_bonus_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     try:
         amount = float(update.message.text)
         if amount < 0: raise ValueError
@@ -16171,7 +16206,7 @@ async def set_daily_bonus_step(update: Update, context: ContextTypes.DEFAULT_TYP
     # --- FIX ENDS HERE ---
 
 async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     message_text = update.message.text
     all_user_ids = get_all_registered_user_ids()
     sent_count = 0
@@ -16195,7 +16230,7 @@ async def admin_broadcast_step(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def admin_search_user_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return ConversationHandler.END
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
     username_or_id = update.message.text
     target_user_id = None
 
@@ -16292,7 +16327,7 @@ async def display_admin_user_panel(update: Update, context: ContextTypes.DEFAULT
 
 async def admin_user_search_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is an admin-only area.", show_alert=True)
         return
 
@@ -16331,7 +16366,7 @@ async def admin_user_search_callback(update: Update, context: ContextTypes.DEFAU
 
 async def setbal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID: return
+    if not is_admin(user.id): return
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     args = context.args
@@ -16373,7 +16408,7 @@ async def setbal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ## NEW FEATURE - Admin Daily Bonus Commands ##
 async def setdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This is an admin-only command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -16396,7 +16431,7 @@ async def setdaily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dailyoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This is an admin-only command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -16406,7 +16441,7 @@ async def dailyoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def dailyon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This is an admin-only command.")
         return
     await ensure_user_in_wallets(user.id, user.username, context=context)
@@ -16560,7 +16595,7 @@ async def active_games_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 async def active_all_games_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID:
+    if not is_admin(update.effective_user.id):
         return
     await ensure_user_in_wallets(update.effective_user.id, update.effective_user.username, context=context)
     context.user_data['active_games_page'] = 0
@@ -16612,7 +16647,7 @@ async def send_active_games_page(update: Update, context: ContextTypes.DEFAULT_T
 
 async def active_all_navigation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is an admin-only button.", show_alert=True)
         return
 
@@ -17017,7 +17052,7 @@ async def withdrawal_approve_callback(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     await query.answer()
     
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("Only the owner can approve withdrawals.", show_alert=True)
         return
     
@@ -17087,7 +17122,7 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer()
     
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("Only the owner can cancel withdrawals.", show_alert=True)
         return
     
@@ -17236,7 +17271,7 @@ async def cancel_recovery_conversation(update: Update, context: ContextTypes.DEF
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != BOT_OWNER_ID:
+    if not is_admin(user.id):
         await update.message.reply_text("This is an owner-only command.")
         return
     
@@ -17267,7 +17302,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"An error occurred during export: {e}")
 
 async def reset_recovery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != BOT_OWNER_ID: return
+    if not is_admin(update.effective_user.id): return
     
     if not context.args or len(context.args) != 1:
         await update.message.reply_text("Usage: /reset @username")
@@ -17501,7 +17536,7 @@ async def bonus_adjust_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle bonus adjustment button clicks"""
     query = update.callback_query
     
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is admin only!", show_alert=True)
         return
     
@@ -17595,7 +17630,7 @@ async def bonus_notify_callback(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle notify users decision"""
     query = update.callback_query
     
-    if query.from_user.id != BOT_OWNER_ID:
+    if not is_admin(query.from_user.id):
         await query.answer("This is admin only!", show_alert=True)
         return
     
@@ -18291,6 +18326,8 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             game_id = generate_unique_id("MN")
             game_sessions[game_id] = {
                 "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
+                "active_currency": get_active_currency(user.id),
+                "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
                 "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
                 "picks": [], "total_cells": total_cells, "num_mines": num_mines,
                 "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
@@ -18485,6 +18522,8 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
     game_sessions[game_id] = {
         "id": game_id, "game_type": f"pvb_{game_type}", "user_id": user.id,
         "bet_amount": bet_amount, "status": "active", "timestamp": str(datetime.now(timezone.utc)),
+        "active_currency": get_active_currency(user.id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user.id), 1.0),
         "target_score": target_score, "current_round": 1,
         "user_score": 0, "bot_score": 0, 
         "bot_rolls": [],
@@ -18984,7 +19023,7 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = update.message.text.strip().split()
     
     # Admin commands
-    if user.id == BOT_OWNER_ID and len(args) > 1:
+    if is_admin(user.id) and len(args) > 1:
         if args[1].lower() == "on":
             bot_settings["demo_enabled"] = True
             save_all_data()
