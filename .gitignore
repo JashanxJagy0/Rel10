@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+user_data/
+escrow_deals/
+logs/
+group_data/
+recovery_data/
+gift_codes/
+bot_state.json
+deposits.db
