@@ -404,7 +404,7 @@ if HELPER_BOT_TOKEN:
         helper_bot = None
 
 # --- In-memory Data ---
-user_wallets = {}
+user_wallets = {}  # REFACTORED: Dict[int, Dict[str, float]] - Multi-currency crypto wallets
 username_to_userid = {}
 user_stats = {}
 # REFACTOR: Centralized session/game management
@@ -418,6 +418,133 @@ provably_fair_records = {} # NEW: Store provably fair verification data for comp
 gift_codes = {} # NEW: To hold gift code data
 withdrawal_requests = {} # NEW: To hold pending withdrawal requests
 crypto_prices = {}  # NEW: Cache for cryptocurrency prices
+
+# --- Live Price Engine (Stake.com-style Multi-Currency) ---
+SUPPORTED_CRYPTOS = ["USDT", "BTC", "ETH", "SOL", "BNB", "TRX", "LTC"]
+LIVE_PRICES = {
+    "USDT": 1.0,
+    "BTC": 60000.0,
+    "ETH": 2000.0,
+    "SOL": 100.0,
+    "BNB": 300.0,
+    "TRX": 0.10,
+    "LTC": 70.0,
+}
+CRYPTO_SYMBOLS = {
+    "USDT": "💵", "BTC": "₿", "ETH": "💎", "SOL": "◎",
+    "BNB": "🔶", "TRX": "🔷", "LTC": "🪙",
+}
+# Decimal precision per crypto: BTC gets 8, others get 5
+CRYPTO_PRECISION = {
+    "BTC": 8, "ETH": 5, "SOL": 5, "BNB": 5,
+    "TRX": 2, "LTC": 5, "USDT": 2,
+}
+
+async def update_live_prices():
+    """Background task: fetch live prices from MEXC API every 5 minutes."""
+    global LIVE_PRICES
+    symbols_map = {
+        "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL",
+        "TRXUSDT": "TRX", "LTCUSDT": "LTC", "BTCUSDT": "BTC",
+    }
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get("https://api.mexc.com/api/v3/ticker/price")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    price_map = {item["symbol"]: float(item["price"]) for item in data}
+                    for api_sym, coin in symbols_map.items():
+                        if api_sym in price_map and price_map[api_sym] > 0:
+                            LIVE_PRICES[coin] = price_map[api_sym]
+                    LIVE_PRICES["USDT"] = 1.0  # Always fixed
+                    logging.info(f"Live prices updated: { {k: f'${v:,.2f}' for k, v in LIVE_PRICES.items()} }")
+                else:
+                    logging.warning(f"MEXC price API returned status {resp.status_code}")
+        except Exception as e:
+            logging.warning(f"Failed to fetch live prices: {e}")
+        await asyncio.sleep(300)  # 5 minutes
+
+
+def format_crypto_amount(amount: float, coin: str) -> str:
+    """Format crypto amount with appropriate precision."""
+    precision = CRYPTO_PRECISION.get(coin, 5)
+    return f"{amount:.{precision}f}"
+
+
+def get_active_currency(user_id: int) -> str:
+    """Get user's active crypto currency for betting/transactions."""
+    return user_stats.get(user_id, {}).get("active_currency", "USDT")
+
+
+def ensure_wallet_dict(user_id: int) -> dict:
+    """Ensure user_wallets[user_id] is a dict. Migrate from float if needed."""
+    wallet = user_wallets.get(user_id)
+    if wallet is None:
+        user_wallets[user_id] = {"USDT": 0.0}
+    elif isinstance(wallet, (int, float)):
+        user_wallets[user_id] = {"USDT": float(wallet)}
+    return user_wallets[user_id]
+
+
+def get_active_balance_usd(user_id: int) -> float:
+    """Get the active currency balance in USD equivalent."""
+    wallet = ensure_wallet_dict(user_id)
+    coin = get_active_currency(user_id)
+    crypto_balance = wallet.get(coin, 0.0)
+    price = LIVE_PRICES.get(coin, 1.0)
+    return crypto_balance * price
+
+
+def get_total_balance_usd(user_id: int) -> float:
+    """Get total portfolio value in USD across all coins."""
+    wallet = ensure_wallet_dict(user_id)
+    total = 0.0
+    for coin, amount in wallet.items():
+        price = LIVE_PRICES.get(coin, 1.0)
+        total += amount * price
+    return total
+
+
+def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
+    """Deduct crypto equivalent of USD amount from user's wallet.
+    Returns (crypto_amount, coin)."""
+    wallet = ensure_wallet_dict(user_id)
+    if coin is None:
+        coin = get_active_currency(user_id)
+    price = LIVE_PRICES.get(coin, 1.0)
+    crypto_amount = usd_amount / price
+    wallet[coin] = wallet.get(coin, 0.0) - crypto_amount
+    return crypto_amount, coin
+
+
+def credit_wallet(user_id: int, usd_amount: float, coin: str = None):
+    """Credit crypto equivalent of USD amount to user's wallet.
+    Returns (crypto_amount, coin)."""
+    wallet = ensure_wallet_dict(user_id)
+    if coin is None:
+        coin = get_active_currency(user_id)
+    price = LIVE_PRICES.get(coin, 1.0)
+    crypto_amount = usd_amount / price
+    wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
+    return crypto_amount, coin
+
+
+def credit_wallet_crypto(user_id: int, crypto_amount: float, coin: str):
+    """Credit a specific crypto amount directly (no conversion)."""
+    wallet = ensure_wallet_dict(user_id)
+    wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
+
+
+def calculate_bet_deduction(user_id: int, bet_amount_usd: float) -> tuple:
+    """Stake-style: calculate crypto deduction for a USD bet.
+    Returns (crypto_amount, coin, has_sufficient) tuple."""
+    coin = get_active_currency(user_id)
+    price = LIVE_PRICES.get(coin, 1.0)
+    crypto_amount = bet_amount_usd / price
+    wallet = ensure_wallet_dict(user_id)
+    has_sufficient = wallet.get(coin, 0.0) >= crypto_amount
+    return crypto_amount, coin, has_sufficient
 
 # NEW: Leaderboard data structures
 leaderboard_data = {
@@ -546,13 +673,13 @@ DASHBOARD_CONFIG = {
     }
 }
 
-## NEW FEATURE - Currency System ##
-# Exchange rates as of implementation (relative to USD)
+## NEW FEATURE - Currency System (Refactored for Multi-Currency Crypto) ##
+# Legacy fiat rates kept for backward compat with display-only code
 CURRENCY_RATES = {
     "USD": 1.0,
-    "INR": 83.12,    # 1 USD = 83.12 INR
-    "EUR": 0.92,     # 1 USD = 0.92 EUR
-    "GBP": 0.79      # 1 USD = 0.79 GBP
+    "INR": 83.12,
+    "EUR": 0.92,
+    "GBP": 0.79
 }
 
 CURRENCY_SYMBOLS = {
@@ -563,7 +690,7 @@ CURRENCY_SYMBOLS = {
 }
 
 def convert_currency(amount_usd, to_currency="USD"):
-    """Convert amount from USD to target currency"""
+    """Convert amount from USD to target currency (for display only)"""
     return amount_usd * CURRENCY_RATES.get(to_currency, 1.0)
 
 def convert_to_usd(amount, from_currency="USD"):
@@ -571,33 +698,28 @@ def convert_to_usd(amount, from_currency="USD"):
     return amount / CURRENCY_RATES.get(from_currency, 1.0)
 
 def format_currency(amount_usd, currency="USD"):
-    """Format amount in the specified currency"""
-    converted = convert_currency(amount_usd, currency)
-    symbol = CURRENCY_SYMBOLS.get(currency, "$")
-    return f"{symbol}{converted:,.2f}"
+    """Format amount in USD display"""
+    return f"${amount_usd:,.2f}"
 
 def parse_bet_amount(amount_str: str, user_id: int) -> tuple:
     """
-    Parse bet amount from user input and convert to USD.
-    Returns (amount_in_usd, amount_in_user_currency, user_currency)
+    Parse bet amount from user input (always in USD).
+    Checks active crypto balance. Returns (amount_in_usd, amount_in_usd, 'USD').
     """
-    user_currency = get_user_currency(user_id)
-    balance_usd = user_wallets.get(user_id, 0.0)
+    balance_usd = get_active_balance_usd(user_id)
     
     amount_str = amount_str.lower().strip()
     
     if amount_str == 'all':
         amount_usd = balance_usd
-        amount_in_currency = convert_currency(balance_usd, user_currency)
     else:
-        amount_in_currency = float(amount_str)
-        amount_usd = convert_to_usd(amount_in_currency, user_currency)
+        amount_usd = float(amount_str)
     
-    return amount_usd, amount_in_currency, user_currency
+    return amount_usd, amount_usd, "USD"
 
 def get_user_currency(user_id):
-    """Get user's preferred currency"""
-    return user_stats.get(user_id, {}).get("userinfo", {}).get("currency", "USD")
+    """Get user's active crypto currency (replaces old fiat currency getter)"""
+    return get_active_currency(user_id)
 
 
 ## NEW FEATURE - Achievements ##
@@ -2580,7 +2702,7 @@ class BlockMonitor:
                     
                     # Credit user only after confirmations
                     if telegram_id in user_wallets:
-                        user_wallets[telegram_id] += amount_usd
+                        credit_wallet(telegram_id, amount_usd)
                         # Track deposit for wager requirement (2x)
                         if telegram_id in user_stats:
                             user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
@@ -2634,7 +2756,7 @@ class BlockMonitor:
                             
                             # Credit user only after confirmations
                             if telegram_id in user_wallets:
-                                user_wallets[telegram_id] += amount_usd
+                                credit_wallet(telegram_id, amount_usd)
                                 # Track deposit for wager requirement (2x)
                                 if telegram_id in user_stats:
                                     user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
@@ -3719,7 +3841,17 @@ def load_all_user_data():
                 with open(os.path.join(DATA_DIR, fname), "r") as f:
                     data = json.load(f)
                     user_id = int(fname.split(".")[0])
-                    user_wallets[user_id] = data.get("wallet", 0.0)
+                    # Migration: convert float wallet to dict
+                    raw_wallet = data.get("wallet", 0.0)
+                    if isinstance(raw_wallet, (int, float)):
+                        user_wallets[user_id] = {"USDT": float(raw_wallet)}
+                    elif isinstance(raw_wallet, dict):
+                        user_wallets[user_id] = raw_wallet
+                    else:
+                        user_wallets[user_id] = {"USDT": 0.0}
+                    # Migrate active_currency to user_stats
+                    if "active_currency" not in data:
+                        data["active_currency"] = "USDT"
                     username = data.get("userinfo", {}).get("username")
                     if username:
                         username_to_userid[normalize_username(username)] = user_id
@@ -3732,7 +3864,7 @@ def save_user_data(user_id):
         logging.warning(f"Attempted to save data for non-existent user: {user_id}")
         return
     data = user_stats.get(user_id, {})
-    data["wallet"] = user_wallets.get(user_id, 0.0)
+    data["wallet"] = ensure_wallet_dict(user_id)
     with open(os.path.join(DATA_DIR, f"{user_id}.json"), "w") as f:
         json.dump(data, f, default=str, indent=2)
 
@@ -3782,8 +3914,15 @@ def load_bot_state():
         try:
             with open(STATE_FILE, "r") as f:
                 state = json.load(f)
-            # Convert string keys back to int for wallets
-            user_wallets.update({int(k): v for k, v in state.get('user_wallets', {}).items()})
+            # Convert string keys back to int for wallets and migrate floats to dicts
+            for k, v in state.get('user_wallets', {}).items():
+                uid = int(k)
+                if isinstance(v, (int, float)):
+                    user_wallets[uid] = {"USDT": float(v)}
+                elif isinstance(v, dict):
+                    user_wallets[uid] = v
+                else:
+                    user_wallets[uid] = {"USDT": 0.0}
             username_to_userid.update(state.get('username_to_userid', {}))
             game_sessions.update(state.get('game_sessions', {}))
             user_pending_invitations.update(state.get('user_pending_invitations', {}))
@@ -4074,7 +4213,7 @@ async def generate_dashboard_image(user_id: int, context: ContextTypes.DEFAULT_T
         # Get user data
         stats = user_stats.get(user_id, {})
         userinfo = stats.get('userinfo', {})
-        balance = user_wallets.get(user_id, 0.0)
+        balance = get_total_balance_usd(user_id)
         user_currency = get_user_currency(user_id)
         
         # Get actual user info from Telegram
@@ -4121,8 +4260,8 @@ async def generate_dashboard_image(user_id: int, context: ContextTypes.DEFAULT_T
             "username": f"@{username}",
             "bot_username": bot_username,
             "level": level_data['name'],
-            "balance": format_currency(balance, user_currency),
-            "last_win": format_currency(last_win, user_currency) if last_win > 0 else "Play to win!",
+            "balance": f"${balance:,.2f}",
+            "last_win": f"${last_win:,.2f}" if last_win > 0 else "Play to win!",
             "member_since": join_date
         }
         
@@ -4186,7 +4325,7 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
             except (BadRequest, Forbidden):
                 logging.warning(f"Could not fetch user info for new user {user_id}")
 
-        user_wallets[user_id] = 0.0
+        user_wallets[user_id] = {"USDT": 0.0}
         user_stats[user_id] = {
             "userinfo": {
                 "user_id": user_id, 
@@ -4196,6 +4335,7 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
                 "language": DEFAULT_LANG, 
                 "currency": "USD"
             },
+            "active_currency": "USDT",
             "deposits": [], # Changed to list of dicts
             "withdrawals": [], # Changed to list of dicts
             "tips_received": {"count": 0, "amount": 0.0},
@@ -4405,16 +4545,29 @@ async def send_insufficient_balance_message(update: Update, message: str = None,
 
 def format_balance_with_locked(user_id: int, currency: str = "USD") -> str:
     """
-    Format balance including locked funds in active games.
-    Returns formatted string like "10.50$ + { 5.00$ in game ( mines ) }"
+    Format multi-currency portfolio balance including locked funds in active games.
+    Shows total portfolio value in USD and per-coin breakdown.
     """
-    balance_usd = user_wallets.get(user_id, 0.0)
-    formatted_balance = format_currency(balance_usd, currency)
+    wallet = ensure_wallet_dict(user_id)
+    total_usd = get_total_balance_usd(user_id)
+    active_coin = get_active_currency(user_id)
+    
+    # Build multi-line balance
+    lines = [f"💰 Total Portfolio: ${total_usd:,.2f}\n"]
+    for coin, amount in wallet.items():
+        if amount > 0 or coin == active_coin:
+            price = LIVE_PRICES.get(coin, 1.0)
+            usd_val = amount * price
+            symbol = CRYPTO_SYMBOLS.get(coin, "💎")
+            formatted_amount = format_crypto_amount(amount, coin)
+            if usd_val > 0.001 or coin == active_coin:
+                lines.append(f"{symbol} {coin}: ${usd_val:,.2f} ({formatted_amount} {coin})")
+    
+    lines.append(f"\n🔹 Active Currency: {active_coin}")
     
     locked_info = get_locked_balance_in_games(user_id)
     
     if locked_info['total'] > 0:
-        # Group by game type for cleaner display
         game_totals = {}
         for game in locked_info['games']:
             game_type = game['game_type']
@@ -4422,16 +4575,14 @@ def format_balance_with_locked(user_id: int, currency: str = "USD") -> str:
                 game_totals[game_type] = 0.0
             game_totals[game_type] += game['amount']
         
-        # Format locked balance display
         locked_parts = []
         for game_type, amount in game_totals.items():
-            formatted_locked = format_currency(amount, currency)
-            locked_parts.append(f"{formatted_locked} in game ( {game_type} )")
+            locked_parts.append(f"${amount:,.2f} in game ( {game_type} )")
         
         locked_str = " + ".join(locked_parts)
-        return f"{formatted_balance} + {{ {locked_str} }}"
+        lines.append(f"🔒 Locked: {locked_str}")
     
-    return formatted_balance
+    return "\n".join(lines)
 
 ## NEW FEATURE - Achievement System ##
 async def check_and_award_achievements(user_id, context, multiplier=0):
@@ -4515,7 +4666,7 @@ async def check_and_award_level_up(user_id: int, context: ContextTypes.DEFAULT_T
             break  # Levels are ordered, no need to check further
         if level_name not in claimed_rewards:
             # Award bonus
-            user_wallets[user_id] += bonus
+            credit_wallet(user_id, bonus)
             user_stats[user_id].setdefault("claimed_level_rewards", []).append(level_name)
             save_user_data(user_id)
             
@@ -4547,7 +4698,7 @@ async def process_referral_commission(user_id, amount, commission_type):
     commission = amount * rate
     if commission > 0:
         await ensure_user_in_wallets(referrer_id)
-        user_wallets[referrer_id] = user_wallets.get(referrer_id, 0.0) + commission
+        credit_wallet(referrer_id, commission)
         user_stats[referrer_id]['referral']['commission_earned'] += commission
         save_user_data(referrer_id)
         logging.info(f"Awarded ${commission:.4f} commission to referrer {referrer_id} from user {user_id}'s {commission_type}.")
@@ -4769,7 +4920,7 @@ def update_pnl(user_id):
     stats = user_stats[user_id]
     total_deposits = sum(d['amount'] for d in stats.get('deposits', []))
     total_withdrawals = sum(w['amount'] for w in stats.get('withdrawals', []))
-    stats["pnl"] = (total_withdrawals + user_wallets.get(user_id, 0.0)) - (total_deposits + stats["tips_received"]["amount"])
+    stats["pnl"] = (total_withdrawals + get_total_balance_usd(user_id)) - (total_deposits + stats["tips_received"]["amount"])
     save_user_data(user_id)
 
 def update_leaderboards(user_id, bet_amount, win_amount=0, game_type="", multiplier=0):
@@ -5132,22 +5283,40 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             return
 
-        # Ask for withdrawal amount
-        user_currency = get_user_currency(user.id)
-        formatted_balance = format_currency(user_wallets.get(user.id, 0.0), user_currency)
+        # Ask for withdrawal: Step 1 - Select crypto
+        wallet = ensure_wallet_dict(user.id)
+        keyboard = []
+        for coin in SUPPORTED_CRYPTOS:
+            bal = wallet.get(coin, 0.0)
+            price = LIVE_PRICES.get(coin, 1.0)
+            usd_val = bal * price
+            if usd_val > 0.01:
+                symbol = CRYPTO_SYMBOLS.get(coin, "💎")
+                formatted = format_crypto_amount(bal, coin)
+                keyboard.append([InlineKeyboardButton(
+                    f"{symbol} {coin} - ${usd_val:,.2f} ({formatted})",
+                    callback_data=f"withdraw_coin_{coin}"
+                )])
+        keyboard.append([InlineKeyboardButton("Cancel", callback_data="back_to_main")])
+        
+        if len(keyboard) <= 1:
+            await safe_edit_message(
+                query,
+                "❌ <b>No Balance</b>\n\nYou don't have any crypto balance to withdraw.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_to_main")]])
+            )
+            return
         
         await safe_edit_message(
             query,
-            f"💸 <b>Withdrawal Request</b>\n\n"
-            f"<b>Current Balance:</b> {formatted_balance}\n"
+            f"💸 <b>Withdrawal - Select Coin</b>\n\n"
             f"<b>Withdrawal Address:</b> <code>{withdrawal_address}</code>\n\n"
-            f"Please enter the amount you want to withdraw in {user_currency}.\n"
-            f"Type 'all' to withdraw your entire balance.",
+            f"Select the crypto you want to withdraw:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="back_to_main")]])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        context.user_data['withdrawal_flow'] = True
-        return WITHDRAWAL_AMOUNT
+        return
 
     elif data == "main_games":
         await games_menu(update, context)
@@ -5156,22 +5325,35 @@ async def main_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await escrow_command(update, context, from_callback=True)
 
     elif data == "main_wallet":
-        balance = user_wallets.get(user.id, 0.0)
+        wallet = ensure_wallet_dict(user.id)
+        total_usd = get_total_balance_usd(user.id)
+        active_coin = get_active_currency(user.id)
         stats = user_stats.get(user.id, {})
         total_deposits = sum(d['amount'] for d in stats.get('deposits', []))
         total_withdrawals = sum(w['amount'] for w in stats.get('withdrawals', []))
-        
-        user_currency = get_user_currency(user.id)
+
+        # Build multi-currency wallet display
+        portfolio_lines = []
+        for coin, amount in wallet.items():
+            if amount > 0.0 or coin == active_coin:
+                price = LIVE_PRICES.get(coin, 1.0)
+                usd_val = amount * price
+                symbol = CRYPTO_SYMBOLS.get(coin, "💎")
+                formatted = format_crypto_amount(amount, coin)
+                if usd_val > 0.001 or coin == active_coin:
+                    portfolio_lines.append(f"{symbol} {coin}: ${usd_val:,.2f} ({formatted} {coin})")
 
         wallet_text = (
             f"💼 <b>Your Wallet</b>\n\n"
-            f"💰 Balance: <b>{format_currency(balance, user_currency)}</b>\n"
-            f"🎲 Total Wagered: {format_currency(stats.get('bets', {}).get('amount', 0.0), user_currency)}\n"
+            f"💰 Total Portfolio: <b>${total_usd:,.2f}</b>\n\n"
+            + "\n".join(portfolio_lines) + "\n\n"
+            f"🔹 Active Currency: {active_coin}\n"
+            f"🎲 Total Wagered: ${stats.get('bets', {}).get('amount', 0.0):,.2f}\n"
             f"🏆 Wins: {stats.get('bets', {}).get('wins', 0)}\n"
             f"💔 Losses: {stats.get('bets', {}).get('losses', 0)}\n"
-            f"📈 P&L: <b>{format_currency(stats.get('pnl', 0.0), user_currency)}</b>\n"
-            f"💵 Total Deposited: {format_currency(total_deposits, user_currency)}\n"
-            f"💸 Total Withdrawn: {format_currency(total_withdrawals, user_currency)}"
+            f"📈 P&L: <b>${stats.get('pnl', 0.0):,.2f}</b>\n"
+            f"💵 Total Deposited: ${total_deposits:,.2f}\n"
+            f"💸 Total Withdrawn: ${total_withdrawals:,.2f}"
         )
 
         keyboard = [
@@ -5912,7 +6094,7 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     user_currency = get_user_currency(user.id)
-    formatted_balance = format_currency(user_wallets.get(user.id, 0.0), user_currency)
+    formatted_balance = format_currency(get_active_balance_usd(user.id), user_currency)
 
     if len(args) != 2:
         await update.message.reply_text(f"Usage: /bj amount\nExample: /bj 5 or /bj all\nYour balance: {formatted_balance}")
@@ -5928,11 +6110,11 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount_usd, 'blackjack'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+    if get_active_balance_usd(user.id) < bet_amount_usd:
         await send_insufficient_balance_message(update, f"❌ You don't have enough balance. Your balance: {formatted_balance}")
         return
 
-    user_wallets[user.id] -= bet_amount_usd
+    deduct_wallet(user.id, bet_amount_usd)
     save_user_data(user.id)
 
     # Use user's provably fair seeds
@@ -5995,7 +6177,7 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[await create_provably_fair_button(game_id, context)]]
         
         if dealer_value == 21:
-            user_wallets[user.id] += bet_amount_usd
+            credit_wallet(user.id, bet_amount_usd)
             save_user_data(user.id)
             await update.message.reply_text(
                 f"{hand_text}\n{format_hand('Dealer hand', dealer_hand, dealer_value)}\n"
@@ -6007,7 +6189,7 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Blackjack pays 2.425x (3% house edge)
             winnings_usd = bet_amount_usd * 2.425
             winnings_currency = bet_amount_currency * 2.425
-            user_wallets[user.id] += winnings_usd
+            credit_wallet(user.id, winnings_usd)
             update_stats_on_bet(user.id, game_id, bet_amount_usd, True, multiplier=2.425, context=context)
             update_pnl(user.id)
             save_user_data(user.id)
@@ -6024,7 +6206,7 @@ async def blackjack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("✋ Stand", callback_data=f"bj_stand_{game_id}")],
     ]
 
-    if len(player_hand) == 2 and user_wallets.get(user.id, 0.0) >= bet_amount_usd:
+    if len(player_hand) == 2 and get_active_balance_usd(user.id) >= bet_amount_usd:
         keyboard.append([InlineKeyboardButton("⬆️ Double Down", callback_data=f"bj_double_{game_id}")])
 
     await update.message.reply_text(
@@ -6138,7 +6320,7 @@ async def blackjack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await handle_dealer_turn(query, context, game_id)
 
     elif action == "double":
-        if user_wallets.get(user.id, 0.0) < game["bet_amount"]:
+        if get_active_balance_usd(user.id) < game["bet_amount"]:
             # Show alert with deposit option
             await query.answer("❌ Not enough balance to double down!", show_alert=True)
             # Edit message to show back button
@@ -6148,14 +6330,14 @@ async def blackjack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await query.edit_message_text(
                 f"❌ You don't have enough balance to double down.\n\n"
                 f"Required: ${game['bet_amount']:.2f}\n"
-                f"Your balance: ${user_wallets.get(user.id, 0.0):.2f}\n\n"
+                f"Your balance: ${get_active_balance_usd(user.id):.2f}\n\n"
                 f"Please deposit to continue.",
                 reply_markup=keyboard,
                 parse_mode=ParseMode.HTML
             )
             return
 
-        user_wallets[user.id] -= game["bet_amount"]
+        deduct_wallet(user.id, game["bet_amount"])
         game["bet_amount"] *= 2
         game["doubled"] = True
         save_user_data(user.id)
@@ -6208,7 +6390,7 @@ async def handle_dealer_turn(query, context, game_id):
     if dealer_value > 21:
         # Regular win pays 1.94x (3% house edge)
         winnings = game["bet_amount"] * 1.94
-        user_wallets[user_id] += winnings
+        credit_wallet(user_id, winnings)
         result = f"🎉 Dealer busts! You win ${winnings:.2f}!"
         game['win'] = True
         update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
@@ -6219,12 +6401,12 @@ async def handle_dealer_turn(query, context, game_id):
     elif player_value > dealer_value:
         # Regular win pays 1.94x (3% house edge)
         winnings = game["bet_amount"] * 1.94
-        user_wallets[user_id] += winnings
+        credit_wallet(user_id, winnings)
         result = f"🎉 You win! ${winnings:.2f}"
         game['win'] = True
         update_stats_on_bet(user_id, game_id, original_bet, True, multiplier=1.94, context=context)
     else:
-        user_wallets[user_id] += game["bet_amount"]
+        credit_wallet(user_id, game["bet_amount"])
         result = "🤝 Push! Bet returned."
         game['win'] = None # No win or loss
 
@@ -6259,7 +6441,7 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet = user_wallets.get(user.id, 0.0)
+            bet = get_active_balance_usd(user.id)
         else:
             bet = float(bet_amount_str)
     except Exception:
@@ -6269,11 +6451,11 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet, 'coin_flip'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet:
+    if get_active_balance_usd(user.id) < bet:
         await send_insufficient_balance_message(update)
         return
 
-    user_wallets[user.id] -= bet
+    deduct_wallet(user.id, bet)
     save_user_data(user.id)
 
     # Use user's provably fair seeds with fresh game client seed (like mines)
@@ -6399,7 +6581,7 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # 1.94x on first win, 3.88x on second, 7.76x on third, etc.
         multiplier = 1.94 * (2 ** (game["streak"] - 1))
         win_amount = game["bet_amount"] * multiplier
-        user_wallets[user.id] += win_amount
+        credit_wallet(user.id, win_amount)
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
@@ -6470,11 +6652,11 @@ async def coinflip_rebet_double_callback(update: Update, context: ContextTypes.D
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet:
+    if get_active_balance_usd(user.id) < bet:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
-    user_wallets[user.id] -= bet
+    deduct_wallet(user.id, bet)
     save_user_data(user.id)
 
     # Use user's provably fair seeds and increment nonce at game start
@@ -6589,7 +6771,7 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet = user_wallets.get(user.id, 0.0)
+            bet = get_active_balance_usd(user.id)
         else:
             bet = float(bet_amount_str)
     except Exception:
@@ -6599,11 +6781,11 @@ async def highlow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet, 'highlow'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet:
+    if get_active_balance_usd(user.id) < bet:
         await send_insufficient_balance_message(update)
         return
     
-    user_wallets[user.id] -= bet
+    deduct_wallet(user.id, bet)
     save_user_data(user.id)
     
     # Use user's provably fair seeds with fresh game client seed (like mines)
@@ -6904,7 +7086,7 @@ async def highlow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif action == "cashout":
         win_amount = game["bet_amount"] * game["current_multiplier"]
-        user_wallets[user.id] += win_amount
+        credit_wallet(user.id, win_amount)
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = game["current_multiplier"]
@@ -6977,11 +7159,11 @@ async def highlow_rebet_double_callback(update: Update, context: ContextTypes.DE
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet:
+    if get_active_balance_usd(user.id) < bet:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
-    user_wallets[user.id] -= bet
+    deduct_wallet(user.id, bet)
     save_user_data(user.id)
 
     # Use user's provably fair seeds
@@ -7151,7 +7333,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             bet_amount_str = args[0].lower()
             if bet_amount_str == 'all':
-                bet_amount = user_wallets.get(user.id, 0.0)
+                bet_amount = get_active_balance_usd(user.id)
             else:
                 bet_amount = float(bet_amount_str)
         except ValueError:
@@ -7163,7 +7345,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Check balance
-        if user_wallets.get(user.id, 0.0) < bet_amount:
+        if get_active_balance_usd(user.id) < bet_amount:
             await send_insufficient_balance_message(update)
             return
         
@@ -7225,7 +7407,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[0].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -7236,7 +7418,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'roulette'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
 
@@ -7253,7 +7435,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid choice. Use a number (0-36), red, black, etc.")
         return
 
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     # Use user's provably fair seeds with fresh game client seed (like mines)
@@ -7293,7 +7475,7 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if win:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
@@ -7378,12 +7560,12 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Check balance
         await ensure_user_in_wallets(user.id, user.username, context=context)
-        if user_wallets.get(user.id, 0.0) < rebet_amount:
+        if get_active_balance_usd(user.id) < rebet_amount:
             await query.answer(f"❌ Insufficient balance! Need ${rebet_amount:.2f}", show_alert=True)
             return
         
         # Deduct bet
-        user_wallets[user.id] -= rebet_amount
+        deduct_wallet(user.id, rebet_amount)
         save_user_data(user.id)
         
         # Generate new result with provably fair
@@ -7439,7 +7621,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Process win/loss
         if win:
             winnings = rebet_amount * multiplier
-            user_wallets[user.id] += winnings
+            credit_wallet(user.id, winnings)
             result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
             update_stats_on_bet(user.id, game_id, rebet_amount, True, multiplier=multiplier, context=context)
         else:
@@ -7639,13 +7821,13 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(user.id, user.username, context=context)
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await safe_edit_message(query, "❌ Insufficient balance.")
         context.user_data.clear()
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Generate result with provably fair seeds and increment nonce at game start
@@ -7709,7 +7891,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Process win/loss
     if win:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
@@ -7770,7 +7952,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -7781,7 +7963,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'dice_roll'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
 
@@ -7791,7 +7973,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid choice. Use 1-6, even, odd, high, or low.")
         return
 
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     await update.message.reply_text(f"🎲 Rolling the dice...")
@@ -7807,7 +7989,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending dice in dice_roll_command: {e}")
         # Refund the bet on error
-        user_wallets[user.id] += bet_amount
+        credit_wallet(user.id, bet_amount)
         save_user_data(user.id)
         await update.message.reply_text("❌ An error occurred while rolling the dice. Your bet has been refunded.")
         return
@@ -7828,7 +8010,7 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if win:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
@@ -7995,7 +8177,7 @@ async def tower_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_str = update.message.text.lower()
         if bet_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_str)
     except ValueError:
@@ -8010,7 +8192,7 @@ async def tower_receive_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return TOWER_BET_AMOUNT
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await update.message.reply_text(
             "❌ Insufficient balance. Please enter a lower amount.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]])
@@ -8085,7 +8267,7 @@ async def tower_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.args and len(context.args) > 0:
             bet_str = context.args[0].lower()
             if bet_str == 'all':
-                bet_amount = user_wallets.get(user.id, 0.0)
+                bet_amount = get_active_balance_usd(user.id)
             else:
                 bet_amount = float(bet_str)
         else:
@@ -8104,7 +8286,7 @@ async def tower_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await update.message.reply_text("❌ Insufficient balance. Please deposit or enter a lower amount.")
         return
     
@@ -8258,7 +8440,7 @@ async def start_tower_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Deduct bet amount
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Use user's provably fair seeds with fresh game client seed (like mines)
@@ -8425,7 +8607,7 @@ async def handle_tower_pick(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if new_floor >= 9:
         multiplier = TOWER_MULTIPLIERS[difficulty][9]
         winnings = game["bet_amount"] * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
@@ -8496,7 +8678,7 @@ async def handle_tower_cashout(update: Update, context: ContextTypes.DEFAULT_TYP
     multiplier = TOWER_MULTIPLIERS[difficulty][current_floor]
     winnings = game["bet_amount"] * multiplier
     
-    user_wallets[user.id] += winnings
+    credit_wallet(user.id, winnings)
     game["status"] = 'completed'
     game["win"] = True
     game["multiplier"] = multiplier
@@ -8576,12 +8758,12 @@ async def tower_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
     # Deduct bet amount
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Use user's provably fair seeds
@@ -8661,7 +8843,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -8671,11 +8853,11 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'slots'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
 
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     # Generate provably fair seeds for slots
@@ -8703,7 +8885,7 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if win:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"🎉 {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
@@ -8786,11 +8968,11 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     # Generate provably fair seeds for slots
@@ -8818,7 +9000,7 @@ async def slots_rebet_double_callback(update: Update, context: ContextTypes.DEFA
 
     if win:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"🎉 {win_type}\nYou win ${winnings:.2f}! (Multiplier: {multiplier}x)"
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=multiplier, context=context)
     else:
@@ -9175,7 +9357,7 @@ async def create_xdxw_challenge(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Invalid bet amount. Please enter a number or 'all'.")
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+    if get_active_balance_usd(user.id) < bet_amount_usd:
         await send_insufficient_balance_message(update)
         return
     
@@ -9240,7 +9422,7 @@ async def xdxw_mode_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await ensure_user_in_wallets(user.id, user.username, context=context)
     
     # Final balance check
-    if user_wallets.get(user.id, 0.0) < challenge_data['bet_amount_usd']:
+    if get_active_balance_usd(user.id) < challenge_data['bet_amount_usd']:
         await query.edit_message_text("❌ Insufficient balance to create this challenge.")
         context.user_data.pop('xdxw_challenge', None)
         return
@@ -9317,7 +9499,7 @@ async def xdxw_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     
     await ensure_user_in_wallets(user.id, user.username, context=context)
     
-    if user_wallets.get(user.id, 0.0) < match["bet_amount_usd"]:
+    if get_active_balance_usd(user.id) < match["bet_amount_usd"]:
         await query.answer("You don't have enough balance for this challenge.", show_alert=True)
         return
     
@@ -9327,8 +9509,8 @@ async def xdxw_accept_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     match["status"] = "active"
     
     # Deduct bets from both players
-    user_wallets[match["host_id"]] -= match["bet_amount_usd"]
-    user_wallets[user.id] -= match["bet_amount_usd"]
+    deduct_wallet(match["host_id"], match["bet_amount_usd"])
+    deduct_wallet(user.id, match["bet_amount_usd"])
     save_user_data(match["host_id"])
     save_user_data(user.id)
     
@@ -9386,7 +9568,7 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["opponent_username"] = "Bot"
     
     # Deduct bet from host
-    user_wallets[user.id] -= match["bet_amount_usd"]
+    deduct_wallet(user.id, match["bet_amount_usd"])
     save_user_data(user.id)
     
     # Setup PvB game state - will be handled by message_listener
@@ -9486,7 +9668,7 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
                 del active_pvb_games[user.id]
             refund_amount = match.get('bet_amount', 0)
             if refund_amount > 0:
-                user_wallets[user.id] += refund_amount
+                credit_wallet(user.id, refund_amount)
                 update_pnl(user.id)
                 save_user_data(user.id)
             return
@@ -9551,7 +9733,7 @@ async def play_single_emoji_game(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount_usd
+    deduct_wallet(user.id, bet_amount_usd)
     save_user_data(user.id)
     
     # Send the dice/emoji animation using helper bot in groups
@@ -9588,7 +9770,7 @@ async def play_single_emoji_game(update: Update, context: ContextTypes.DEFAULT_T
     if won:
         winnings_usd = bet_amount_usd * game_config['multiplier']
         winnings_currency = bet_amount_currency * game_config['multiplier']
-        user_wallets[user.id] += winnings_usd
+        credit_wallet(user.id, winnings_usd)
         update_stats_on_bet(user.id, game_id, bet_amount_usd, True, multiplier=game_config['multiplier'], context=context)
         update_pnl(user.id)
         save_user_data(user.id)
@@ -9627,7 +9809,7 @@ async def create_group_challenge(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Usage: /{} <amount>\nExample: /{} 5 or /{} all".format(game_type, game_type, game_type))
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+    if get_active_balance_usd(user.id) < bet_amount_usd:
         await send_insufficient_balance_message(update)
         return
     
@@ -9738,7 +9920,7 @@ async def group_challenge_target_callback(update: Update, context: ContextTypes.
     await ensure_user_in_wallets(user.id, user.username, context=context)
     
     # Final check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+    if get_active_balance_usd(user.id) < bet_amount_usd:
         await query.edit_message_text("❌ Insufficient balance to create this challenge.")
         return
     
@@ -9816,7 +9998,7 @@ async def group_challenge_accept_callback(update: Update, context: ContextTypes.
     
     await ensure_user_in_wallets(user.id, user.username, context=context)
     
-    if user_wallets.get(user.id, 0.0) < match["bet_amount_usd"]:
+    if get_active_balance_usd(user.id) < match["bet_amount_usd"]:
         await query.answer("You don't have enough balance for this challenge.", show_alert=True)
         return
     
@@ -9840,8 +10022,8 @@ async def group_challenge_accept_callback(update: Update, context: ContextTypes.
         match["target_points"] = match.get("target_score", 1)
     
     # Deduct bets from both players
-    user_wallets[match["host_id"]] -= match["bet_amount_usd"]
-    user_wallets[user.id] -= match["bet_amount_usd"]
+    deduct_wallet(match["host_id"], match["bet_amount_usd"])
+    deduct_wallet(user.id, match["bet_amount_usd"])
     save_user_data(match["host_id"])
     save_user_data(user.id)
     
@@ -9883,7 +10065,7 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     match["opponent_username"] = "Bot"
     
     # Deduct bet from host
-    user_wallets[user.id] -= match["bet_amount_usd"]
+    deduct_wallet(user.id, match["bet_amount_usd"])
     save_user_data(user.id)
     
     # Initialize game state for PvP-style play (waiting for emojis)
@@ -10016,10 +10198,10 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     if not await check_bet_limits(update, bet_amount, f'pvb_{game_type}'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await update.message.reply_text("You no longer have enough balance for this bet. Game cancelled.")
         return
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     game_id = generate_unique_id("PVB")
@@ -10093,7 +10275,7 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
                 del context.chat_data[f"active_pvb_game_{user.id}"]
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
-                user_wallets[user.id] += bet_amount
+                credit_wallet(user.id, bet_amount)
                 update_pnl(user.id)
                 save_user_data(user.id)
                 return
@@ -10142,7 +10324,7 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except Exception:
@@ -10153,11 +10335,11 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'predict'):
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
 
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     await update.message.reply_text(f"Rolling the dice... 🎲")
     chat_type = update.effective_chat.type
     animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
@@ -10171,7 +10353,7 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error sending dice in predict_command: {e}")
         # Refund the bet on error
-        user_wallets[user.id] += bet_amount
+        credit_wallet(user.id, bet_amount)
         save_user_data(user.id)
         await update.message.reply_text("❌ An error occurred while rolling the dice. Your bet has been refunded.")
         return
@@ -10181,7 +10363,7 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if win:
         winnings = bet_amount * 2
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         result_text = f"Result: {outcome} 🎲\n🎉 You won! You receive ${winnings:.2f}."
         update_stats_on_bet(user.id, game_id, bet_amount, True, multiplier=2, context=context)
     else:
@@ -10242,7 +10424,7 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
         
@@ -10259,12 +10441,12 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'limbo'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Use user's provably fair seeds with fresh game client seed (like mines)
@@ -10285,7 +10467,7 @@ async def limbo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if win:
         winnings = bet_amount * target_multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         profit = winnings - bet_amount
         result_text = (
             f"🚀 <b>LIMBO RESULT</b> 🚀\n\n"
@@ -10420,7 +10602,7 @@ async def keno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -10430,7 +10612,7 @@ async def keno_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'keno'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
@@ -10560,7 +10742,7 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Deduct bet
-        user_wallets[game["user_id"]] -= game["bet_amount"]
+        deduct_wallet(game["user_id"], game["bet_amount"])
         save_user_data(game["user_id"])
         
         # Use provably fair generation for keno with fresh game client seed (like mines)
@@ -10583,7 +10765,7 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if multiplier > 0:
             winnings = game["bet_amount"] * multiplier
-            user_wallets[game["user_id"]] += winnings
+            credit_wallet(game["user_id"], winnings)
             profit = winnings - game["bet_amount"]
             win = True
         else:
@@ -10704,12 +10886,12 @@ async def keno_rebet_double_callback(update: Update, context: ContextTypes.DEFAU
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     game_id = generate_unique_id("KN")
@@ -10731,7 +10913,7 @@ async def keno_rebet_double_callback(update: Update, context: ContextTypes.DEFAU
     
     if multiplier > 0:
         winnings = bet_amount * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         profit = winnings - bet_amount
         win = True
     else:
@@ -10829,7 +11011,7 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
         
@@ -10846,12 +11028,12 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'crash'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Generate provably fair crash point
@@ -10869,7 +11051,7 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             multiplier = auto_cashout
             winnings = bet_amount * multiplier
             profit = winnings - bet_amount
-            user_wallets[user.id] += winnings
+            credit_wallet(user.id, winnings)
             win = True
             result_text = (
                 f"📉 <b>CRASH GAME</b>\n\n"
@@ -10901,7 +11083,7 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Example: /crash 10 2.5"
         )
         # Refund since manual mode not fully implemented
-        user_wallets[user.id] += bet_amount
+        credit_wallet(user.id, bet_amount)
         await update.message.reply_text(result_text, parse_mode=ParseMode.HTML)
         return
     
@@ -10958,7 +11140,7 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
         
@@ -10973,12 +11155,12 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'plinko'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Generate provably fair result
@@ -10994,7 +11176,7 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Generate game ID first before using it
     game_id = generate_unique_id('PLINKO')
     
-    user_wallets[user.id] += winnings
+    credit_wallet(user.id, winnings)
     update_stats_on_bet(user.id, game_id, bet_amount, win, multiplier=multiplier, context=context)
     save_user_data(user.id)
     
@@ -11060,7 +11242,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -11070,12 +11252,12 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'wheel'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Generate provably fair result
@@ -11091,7 +11273,7 @@ async def wheel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Generate game ID first before using it
     game_id = generate_unique_id('WHEEL')
     
-    user_wallets[user.id] += winnings
+    credit_wallet(user.id, winnings)
     update_stats_on_bet(user.id, game_id, bet_amount, win, multiplier=multiplier, context=context)
     save_user_data(user.id)
     
@@ -11157,7 +11339,7 @@ async def scratch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -11167,12 +11349,12 @@ async def scratch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'scratch'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Generate 9 symbols using weighted random
@@ -11202,7 +11384,7 @@ async def scratch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winnings = bet_amount * multiplier
         profit = winnings - bet_amount
         win = True
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
     else:
         multiplier = 0
         win = False
@@ -11242,7 +11424,7 @@ async def coinchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = args[1].lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -11252,7 +11434,7 @@ async def coinchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'coinchain'):
         return
     
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
     
@@ -11269,7 +11451,7 @@ async def coinchain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     
     # Deduct bet
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     keyboard = [
@@ -11313,7 +11495,7 @@ async def coinchain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         winnings = game["bet_amount"] * multiplier
         profit = winnings - game["bet_amount"]
         
-        user_wallets[user_id] += winnings
+        credit_wallet(user_id, winnings)
         game["status"] = "completed"
         update_stats_on_bet(user_id, game_id, game["bet_amount"], True, multiplier=multiplier, context=context)
         save_user_data(user_id)
@@ -11332,7 +11514,7 @@ async def coinchain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "cancel":
         game["status"] = "cancelled"
         await query.edit_message_text("❌ Coin chain game cancelled. Bet refunded.", parse_mode=ParseMode.HTML)
-        user_wallets[user_id] += game["bet_amount"]
+        credit_wallet(user_id, game["bet_amount"])
         save_user_data(user_id)
         return
     
@@ -11442,7 +11624,7 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         bet_amount_str = update.message.text.lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -11452,7 +11634,7 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_bet_limits(update, bet_amount, 'mines'):
         return SELECT_BET_AMOUNT
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_game")]
         ])
@@ -11484,7 +11666,7 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
     user_stats[user.id]['game_sessions'].append(game_id)
     
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     initial_text = (
@@ -11591,7 +11773,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             game["status"] = 'completed'
             game["win"] = True
             game["multiplier"] = multiplier
-            user_wallets[user.id] += potential_winnings
+            credit_wallet(user.id, potential_winnings)
             # Note: nonce was incremented at game start for provably fair
             update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
             update_pnl(user.id)
@@ -11637,7 +11819,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         multiplier = get_mines_multiplier(game["num_mines"], safe_picks)
         winnings = game["bet_amount"] * multiplier
-        user_wallets[user.id] += winnings
+        credit_wallet(user.id, winnings)
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
@@ -11727,7 +11909,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
-        user_wallets[user.id] += potential_winnings
+        credit_wallet(user.id, potential_winnings)
         # Note: nonce was incremented at game start for provably fair
         update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
         update_pnl(user.id)
@@ -11813,12 +11995,12 @@ async def mines_rebet_double_callback(update: Update, context: ContextTypes.DEFA
         return
     
     # Check balance
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await query.answer("Insufficient balance!", show_alert=True)
         return
     
     # Deduct bet amount
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
     
     # Use user's provably fair seeds and increment nonce at game start
@@ -11878,7 +12060,7 @@ async def cancel_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if game.get("status") == 'active' and 'players' in game: # Only cancel PvP games
             game["status"] = 'cancelled'
             for uid in game["players"]:
-                user_wallets[uid] += game["bet_amount"]
+                credit_wallet(uid, game["bet_amount"])
                 save_user_data(uid)
                 try:
                     await context.bot.send_message(
@@ -11959,7 +12141,7 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid amount or number.")
         return
 
-    if user_wallets.get(user.id, 0.0) < amount:
+    if get_active_balance_usd(user.id) < amount:
         await update.message.reply_text("You do not have enough funds to rain.")
         return
 
@@ -11972,10 +12154,10 @@ async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chosen = random.sample(eligible, N)
     portion = amount / N
-    user_wallets[user.id] -= amount
+    deduct_wallet(user.id, amount)
     rained_on_users = []
     for uid in chosen:
-        user_wallets[uid] = user_wallets.get(uid, 0) + portion
+        credit_wallet(uid, portion)
         await ensure_user_in_wallets(uid, context=context)
         update_stats_on_rain_received(uid, portion)
         update_pnl(uid)
@@ -12011,7 +12193,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
     
     # Get user currency for display
     user_currency = get_user_currency(user.id)
-    balance = user_wallets.get(user.id, 0.0)
+    balance = get_total_balance_usd(user.id)
     formatted_balance = format_currency(balance, user_currency)
     
     if is_group and stats_view == '24h':
@@ -12260,7 +12442,7 @@ async def send_users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pnl = stats.get('pnl', 0.0)
         msg += (
             f"👤 @{username} (ID: <code>{uid}</code>)\n"
-            f"  - 💰 <b>Balance:</b> ${user_wallets.get(uid, 0):.2f}\n"
+            f"  - 💰 <b>Balance:</b> ${get_total_balance_usd(uid):.2f}\n"
             f"  - 📈 <b>P&L:</b> ${pnl:.2f}\n"
             f"  - 🎲 <b>Bets:</b> {stats.get('bets',{}).get('count',0)} (W: {stats.get('bets',{}).get('wins',0)}, L: {stats.get('bets',{}).get('losses',0)})\n"
         )
@@ -12352,7 +12534,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
     game_rolls = int(mode_rolls_str[1])
 
     if amount_str == "all":
-        bet_amount = user_wallets.get(user.id, 0.0)
+        bet_amount = get_active_balance_usd(user.id)
     else:
         try: bet_amount = float(amount_str)
         except ValueError:
@@ -12370,7 +12552,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("Invalid points target.")
         return
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await send_insufficient_balance_message(update)
         return
 
@@ -12385,7 +12567,7 @@ async def generic_emoji_game_command(update: Update, context: ContextTypes.DEFAU
             return
 
     await ensure_user_in_wallets(opponent_id, opponent_username, context=context)
-    if user_wallets.get(opponent_id, 0.0) < bet_amount:
+    if get_active_balance_usd(opponent_id) < bet_amount:
         await update.message.reply_text(f"Opponent {opponent_username} does not have enough balance for this match.")
         return
 
@@ -12971,7 +13153,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 bet_amount_usd, bet_amount_currency, currency = parse_bet_amount(update.message.text, user.id)
                 
-                if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+                if get_active_balance_usd(user.id) < bet_amount_usd:
                     await send_insufficient_balance_message(update)
                     context.user_data.clear()
                     return
@@ -13100,7 +13282,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if user.id in active_pvb_games:
                             del active_pvb_games[user.id]
                         # Refund bet
-                        user_wallets[user.id] += game['bet_amount']
+                        credit_wallet(user.id, game['bet_amount'])
                         update_pnl(user.id)
                         save_user_data(user.id)
                         return
@@ -13148,7 +13330,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Check for game end
             if game["user_score"] >= game["target_score"]:
                 winnings = game["bet_amount"] * 2
-                user_wallets[user.id] += winnings
+                credit_wallet(user.id, winnings)
                 game['status'] = 'completed'
                 game['win'] = True
                 update_stats_on_bet(user.id, game['id'], game['bet_amount'], True, context=context)
@@ -13197,7 +13379,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             del context.chat_data[f"active_pvb_game_{user.id}"]
                             if user.id in active_pvb_games:
                                 del active_pvb_games[user.id]
-                            user_wallets[user.id] += game['bet_amount']
+                            credit_wallet(user.id, game['bet_amount'])
                             update_pnl(user.id)
                             save_user_data(user.id)
                             return
@@ -13403,7 +13585,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             
                             # Credit winner (only if not bot)
                             if final_winner != 0:  # 0 = Bot
-                                user_wallets[final_winner] += winnings
+                                credit_wallet(final_winner, winnings)
                                 update_stats_on_bet(final_winner, match_id, bet_amount, True, pvp_win=True, multiplier=1.94, context=context)
                                 update_pnl(final_winner)
                                 save_user_data(final_winner)
@@ -13484,8 +13666,9 @@ async def clear_confirm_callback(update: Update, context: ContextTypes.DEFAULT_T
     if query.data == "clear_confirm_yes":
         users_affected = 0
         for user_id in list(user_wallets.keys()):
-            if user_wallets[user_id] > 0:
-                user_wallets[user_id] = 0
+            wallet = ensure_wallet_dict(user_id)
+            if any(v > 0 for v in wallet.values()):
+                user_wallets[user_id] = {coin: 0.0 for coin in wallet}
                 if user_id in user_stats:
                     update_pnl(user_id)
                     save_user_data(user_id)
@@ -13582,30 +13765,113 @@ async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Tip amount must be positive.")
         return
 
-    if not is_owner and user_wallets.get(user.id, 0.0) < tip_amount:
+    if not is_owner and get_active_balance_usd(user.id) < tip_amount:
         await update.message.reply_text("You don't have enough balance to tip this amount.")
         return
 
-    if not is_owner: user_wallets[user.id] -= tip_amount
-    await ensure_user_in_wallets(target_user_id, target_username, context=context)
-    user_wallets[target_user_id] = user_wallets.get(target_user_id, 0.0) + tip_amount
+    # Calculate crypto equivalent for confirmation
+    active_coin = get_active_currency(user.id)
+    price = LIVE_PRICES.get(active_coin, 1.0)
+    crypto_amount = tip_amount / price
+    formatted_crypto = format_crypto_amount(crypto_amount, active_coin)
+    tipped_user_mention = f"@{target_username}" if target_username else f"User (ID: {target_user_id})"
 
-    update_stats_on_tip_sent(user.id, tip_amount)
-    update_stats_on_tip_received(target_user_id, tip_amount)
-    
-    # Track tip for wager requirement (1x)
-    if target_user_id in user_stats:
-        user_stats[target_user_id]["unwagered_tips"] = user_stats[target_user_id].get("unwagered_tips", 0.0) + tip_amount
-    
-    update_pnl(user.id); update_pnl(target_user_id)
-    save_user_data(user.id); save_user_data(target_user_id)
+    # Store tip data for confirmation
+    tip_id = f"{user.id}_{target_user_id}_{int(datetime.now(timezone.utc).timestamp())}"
+    context.user_data['pending_tip'] = {
+        'tip_id': tip_id,
+        'sender_id': user.id,
+        'target_user_id': target_user_id,
+        'target_username': target_username,
+        'tip_amount_usd': tip_amount,
+        'crypto_amount': crypto_amount,
+        'coin': active_coin,
+        'is_owner': is_owner,
+    }
 
-    tipped_user_mention = f"@{target_username}" if target_username else f"user (ID: {target_user_id})"
-    await update.message.reply_text(f"You have successfully tipped {tipped_user_mention} ${tip_amount:.2f}.", parse_mode=ParseMode.HTML)
-    try:
-        await context.bot.send_message(chat_id=target_user_id, text=f"You have received a tip of ${tip_amount:.2f} from {user.mention_html()}!", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logging.warning(f"Failed to send tip notification to {target_user_id}: {e}")
+    # Send confirmation message with inline buttons
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Confirm", callback_data=f"confirm_tip_{tip_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_tip_{tip_id}")
+        ]
+    ]
+    await update.message.reply_text(
+        f"⚠️ <b>Confirm Tip</b> ⚠️\n\n"
+        f"💵 Sending: <b>${tip_amount:.2f}</b>\n"
+        f"💎 Actual: <b>{formatted_crypto} {active_coin}</b>\n"
+        f"👤 To: {tipped_user_mention}\n\n"
+        f"Please confirm or cancel.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def tip_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle tip confirmation/cancellation inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    data = query.data
+
+    pending_tip = context.user_data.get('pending_tip')
+    if not pending_tip or pending_tip['sender_id'] != user.id:
+        await query.edit_message_text("❌ This tip confirmation has expired or is not for you.")
+        return
+
+    if data.startswith("cancel_tip_"):
+        context.user_data.pop('pending_tip', None)
+        await query.edit_message_text("❌ Tip cancelled.")
+        return
+
+    if data.startswith("confirm_tip_"):
+        tip_amount = pending_tip['tip_amount_usd']
+        target_user_id = pending_tip['target_user_id']
+        target_username = pending_tip['target_username']
+        coin = pending_tip['coin']
+        crypto_amount = pending_tip['crypto_amount']
+        is_owner = pending_tip['is_owner']
+
+        # Re-check balance
+        if not is_owner and get_active_balance_usd(user.id) < tip_amount:
+            await query.edit_message_text("❌ Insufficient balance. Tip cancelled.")
+            context.user_data.pop('pending_tip', None)
+            return
+
+        # Process the tip
+        if not is_owner:
+            deduct_wallet(user.id, tip_amount, coin)
+        await ensure_user_in_wallets(target_user_id, target_username, context=context)
+        # Credit the same coin to the receiver
+        credit_wallet_crypto(target_user_id, crypto_amount, coin)
+
+        update_stats_on_tip_sent(user.id, tip_amount)
+        update_stats_on_tip_received(target_user_id, tip_amount)
+
+        # Track tip for wager requirement (1x)
+        if target_user_id in user_stats:
+            user_stats[target_user_id]["unwagered_tips"] = user_stats[target_user_id].get("unwagered_tips", 0.0) + tip_amount
+
+        update_pnl(user.id); update_pnl(target_user_id)
+        save_user_data(user.id); save_user_data(target_user_id)
+
+        formatted_crypto = format_crypto_amount(crypto_amount, coin)
+        tipped_user_mention = f"@{target_username}" if target_username else f"user (ID: {target_user_id})"
+        await query.edit_message_text(
+            f"✅ Tip sent to {tipped_user_mention}!\n"
+            f"💵 ${tip_amount:.2f} ({formatted_crypto} {coin})",
+            parse_mode=ParseMode.HTML
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"You received a tip of ${tip_amount:.2f} ({formatted_crypto} {coin}) from {user.mention_html()}!",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception as e:
+            logging.warning(f"Failed to send tip notification to {target_user_id}: {e}")
+
+        context.user_data.pop('pending_tip', None)
 
 @check_banned
 @check_maintenance
@@ -13786,14 +14052,14 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 'players' in game_data: # PvP
             bet_amount = game_data["bet_amount"]
             for player_id in game_data['players']:
-                user_wallets[player_id] += bet_amount
+                credit_wallet(player_id, bet_amount)
                 save_user_data(player_id)
                 try: await context.bot.send_message(player_id, f"Match {item_id} cancelled by owner. Bet of ${bet_amount:.2f} refunded.")
                 except Exception as e: logging.warning(f"Could not notify player {player_id}: {e}")
         elif 'user_id' in game_data: # Solo
             player_id = game_data['user_id']
             bet_amount = game_data['bet_amount']
-            user_wallets[player_id] += bet_amount
+            credit_wallet(player_id, bet_amount)
             save_user_data(player_id)
             try: await context.bot.send_message(player_id, f"Your game {item_id} was cancelled by the owner. Your bet of ${bet_amount:.2f} has been refunded.")
             except Exception as e: logging.warning(f"Could not notify player {player_id}: {e}")
@@ -13844,15 +14110,15 @@ async def match_invite_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     if data.startswith("accept_"):
         await ensure_user_in_wallets(user_id, query.from_user.username, context=context)
-        if user_wallets.get(user_id, 0.0) < match_data["bet_amount"]:
+        if get_active_balance_usd(user_id) < match_data["bet_amount"]:
             await query.edit_message_text(
                 "❌ You don't have enough balance for this bet.",
             )
             match_data["status"] = "cancelled"
             return
 
-        user_wallets[match_data["host_id"]] -= match_data["bet_amount"]
-        user_wallets[opponent_id] -= match_data["bet_amount"]
+        deduct_wallet(match_data["host_id"], match_data["bet_amount"])
+        deduct_wallet(opponent_id, match_data["bet_amount"])
         save_user_data(match_data["host_id"]); save_user_data(opponent_id)
         match_data.update({"status": "active"})
         
@@ -14045,7 +14311,7 @@ async def escrow_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             
             # Add funds to buyer's casino balance
             await ensure_user_in_wallets(buyer_id, context=context)
-            user_wallets[buyer_id] += amount
+            credit_wallet(buyer_id, amount)
             save_user_data(buyer_id)
             
             # Update deal status
@@ -15074,7 +15340,7 @@ async def user_info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 <b>User Info for @{userinfo.get('username','')}</b> (ID: <code>{target_user_id}</code>)\n"
         f"🗓️ Joined: {join_date} UTC\n"
         f"🦄 Level: {level_data['level']} ({level_data['name']})\n" # ADDED
-        f"💰 Balance: ${user_wallets.get(target_user_id, 0.0):.2f}\n"
+        f"💰 Balance: ${get_total_balance_usd(target_user_id):.2f}\n"
         f"📈 PnL: ${stats.get('pnl', 0.0):.2f}\n"
         f"🎲 Total Bets: {stats.get('bets', {}).get('count', 0)} (W: {stats.get('bets', {}).get('wins', 0)}, L: {stats.get('bets', {}).get('losses', 0)})\n"
         f"💸 Total Wagered: ${stats.get('bets', {}).get('amount', 0.0):.2f}\n"
@@ -15342,7 +15608,7 @@ async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from
             return
 
     bonus_amount = bot_settings.get("daily_bonus_amount", 0.50)
-    user_wallets[user.id] += bonus_amount
+    credit_wallet(user.id, bonus_amount)
     stats["last_daily_claim"] = str(datetime.now(timezone.utc))
     save_user_data(user.id)
 
@@ -15440,7 +15706,7 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(get_text("error_occurred", user_lang), show_alert=True)
 
 async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle currency selection"""
+    """Handle crypto currency selection (active currency)"""
     query = update.callback_query
     
     # Check menu ownership BEFORE answering
@@ -15451,14 +15717,14 @@ async def currency_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user = query.from_user
-    currency_code = query.data.split('_')[1]
+    currency_code = query.data.split('_')[1].upper()
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
-    if currency_code in CURRENCY_RATES:
-        user_stats[user.id]["userinfo"]["currency"] = currency_code
+    if currency_code in SUPPORTED_CRYPTOS:
+        user_stats[user.id]["active_currency"] = currency_code
         save_user_data(user.id)
-        symbol = CURRENCY_SYMBOLS[currency_code]
-        await query.answer(f"Currency set to {currency_code} ({symbol})", show_alert=True)
+        symbol = CRYPTO_SYMBOLS.get(currency_code, "💎")
+        await query.answer(f"Active currency set to {symbol} {currency_code}", show_alert=True)
         # Go back to settings menu
         await settings_command(update, context)
     else:
@@ -15474,7 +15740,7 @@ async def admin_dashboard_command(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
 
     total_users = len(user_stats)
-    total_balance = sum(user_wallets.values())
+    total_balance = sum(get_total_balance_usd(uid) for uid in user_wallets)
     active_games = len([g for g in game_sessions.values() if g.get('status') == 'active'])
     pending_withdrawals = len([w for w in withdrawal_requests.values() if w.get('status') == 'pending'])
     banned_users_count = len(bot_settings.get('banned_users', []))
@@ -15709,7 +15975,7 @@ async def admin_export_data_callback(update: Update, context: ContextTypes.DEFAU
             "export_timestamp": str(datetime.now(timezone.utc)),
             "bot_settings": bot_settings,
             "total_users": len(user_stats),
-            "total_balance": sum(user_wallets.values()),
+            "total_balance": sum(get_total_balance_usd(uid) for uid in user_wallets),
             "user_stats": user_stats,
             "user_wallets": user_wallets,
             "active_games": len([g for g in game_sessions.values() if g.get('status') == 'active']),
@@ -15947,7 +16213,7 @@ async def display_admin_user_panel(update: Update, context: ContextTypes.DEFAULT
 
     text = (
         f"👤 <b>Admin Panel for @{userinfo.get('username','')}</b> (ID: <code>{target_user_id}</code>)\n"
-        f"💰 Balance: ${user_wallets.get(target_user_id, 0.0):.2f}\n"
+        f"💰 Balance: ${get_total_balance_usd(target_user_id):.2f}\n"
         f"📈 PnL: ${stats.get('pnl', 0.0):.2f}\n"
         f"💵 Deposits: ${total_deposits:.2f} | 💸 Withdrawals: ${total_withdrawals:.2f}\n"
         f"🚫 Ban Status: {'Banned' if is_banned else 'Not Banned'}\n"
@@ -16059,11 +16325,18 @@ async def setbal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /setbal @username <amount>")
+    if len(args) < 2 or len(args) > 3:
+        await update.message.reply_text("Usage: /setbal @username <amount_usd> [currency]\nExample: /setbal @user 10 ETH\n(Credits $10 worth of ETH at live price)")
         return
 
-    username, amount_str = args[0], args[1]
+    username = args[0]
+    amount_str = args[1]
+    coin = args[2].upper() if len(args) == 3 else "USDT"
+    
+    if coin not in SUPPORTED_CRYPTOS:
+        await update.message.reply_text(f"❌ Unsupported currency. Supported: {', '.join(SUPPORTED_CRYPTOS)}")
+        return
+
     target_user_id = username_to_userid.get(normalize_username(username))
 
     if not target_user_id:
@@ -16071,11 +16344,19 @@ async def setbal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        amount = float(amount_str)
-        user_wallets[target_user_id] = amount
+        amount_usd = float(amount_str)
+        price = LIVE_PRICES.get(coin, 1.0)
+        crypto_amount = amount_usd / price
+        wallet = ensure_wallet_dict(target_user_id)
+        wallet[coin] = wallet.get(coin, 0.0) + crypto_amount
         update_pnl(target_user_id)
         save_user_data(target_user_id)
-        await update.message.reply_text(f"Balance for {username} set to ${amount:.2f}.")
+        formatted = format_crypto_amount(crypto_amount, coin)
+        await update.message.reply_text(
+            f"✅ Credited {username}:\n"
+            f"💵 USD Value: ${amount_usd:.2f}\n"
+            f"💎 {coin}: {formatted} {coin} (@ ${price:,.2f})"
+        )
     except ValueError:
         await update.message.reply_text("Invalid amount.")
 
@@ -16392,14 +16673,14 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_lang = get_user_lang(user.id)
 
     keyboard = [
-        [InlineKeyboardButton(get_text("currency_settings", user_lang), callback_data="settings_currency")],
+        [InlineKeyboardButton("💱 Active Currency", callback_data="settings_currency")],
         [InlineKeyboardButton(get_text("language", user_lang), callback_data="settings_language")],
         [InlineKeyboardButton(get_text("withdrawal_address", user_lang), callback_data="settings_withdrawal")],
         [InlineKeyboardButton(get_text("back", user_lang), callback_data="back_to_main")]
     ]
     
-    user_currency = get_user_currency(user.id)
-    currency_symbol = CURRENCY_SYMBOLS.get(user_currency, "$")
+    active_coin = get_active_currency(user.id)
+    coin_symbol = CRYPTO_SYMBOLS.get(active_coin, "💎")
     user_language = user_stats[user.id].get("userinfo", {}).get("language", "en")
     language_name = LANGUAGES.get(user_language, {}).get("language_name", "English 🇬🇧")
     withdrawal_address = user_stats[user.id].get("withdrawal_address")
@@ -16408,7 +16689,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_message(
         query,
         get_text("settings_menu", user_lang) + f"\n\n"
-        f"<b>Current Currency:</b> {user_currency} ({currency_symbol})\n"
+        f"<b>Active Currency:</b> {coin_symbol} {active_coin}\n"
         f"<b>Current Language:</b> {language_name}\n"
         f"{withdrawal_status}",
         parse_mode=ParseMode.HTML,
@@ -16430,10 +16711,10 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
     action = query.data.split('_')[1] if len(query.data.split('_')) > 1 else None
 
     if action == "currency":
-        current_currency = get_user_currency(user.id)
+        current_currency = get_active_currency(user.id)
         keyboard = []
-        for curr in ["USD", "INR", "EUR", "GBP"]:
-            symbol = CURRENCY_SYMBOLS[curr]
+        for curr in SUPPORTED_CRYPTOS:
+            symbol = CRYPTO_SYMBOLS.get(curr, "💎")
             text = f"{symbol} {curr}"
             if curr == current_currency:
                 text += " ✓"
@@ -16441,9 +16722,10 @@ async def settings_callback_handler(update: Update, context: ContextTypes.DEFAUL
         keyboard.append([InlineKeyboardButton(get_text("back", user_lang), callback_data="main_settings")])
         
         await safe_edit_message(query,
-            f"💱 <b>{get_text('currency_settings', user_lang)}</b>\n\n"
-            "Choose your preferred currency. All amounts will be displayed in this currency.\n"
-            "Your wallet balance is stored in USD and converted for display.",
+            f"💱 <b>Select Active Currency</b>\n\n"
+            "Choose your active crypto currency.\n"
+            "All bets, tips, and games will use this currency.\n"
+            "⚠️ Your balance in each coin is separate (segregated wallets).",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -16553,21 +16835,52 @@ async def change_withdrawal_address_step(update: Update, context: ContextTypes.D
     return await set_withdrawal_address_step(update, context)
 
 # --- Withdrawal Request System ---
+async def withdraw_coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle withdrawal coin selection callback."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    coin = query.data.replace("withdraw_coin_", "")
+    
+    if coin not in SUPPORTED_CRYPTOS:
+        await query.edit_message_text("❌ Invalid crypto selected.")
+        return
+    
+    wallet = ensure_wallet_dict(user.id)
+    balance = wallet.get(coin, 0.0)
+    price = LIVE_PRICES.get(coin, 1.0)
+    balance_usd = balance * price
+    formatted = format_crypto_amount(balance, coin)
+    
+    context.user_data['withdrawal_coin'] = coin
+    context.user_data['withdrawal_flow'] = True
+    
+    await query.edit_message_text(
+        f"💸 <b>Withdraw {coin}</b>\n\n"
+        f"💎 Available: {formatted} {coin} (${balance_usd:,.2f})\n\n"
+        f"Enter the amount in USD you want to withdraw.\n"
+        f"Type 'all' to withdraw your entire {coin} balance.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="back_to_main")]])
+    )
+    return WITHDRAWAL_AMOUNT
+
 async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     amount_str = update.message.text.strip().lower()
     
-    # Get user's currency and balance
-    user_currency = get_user_currency(user.id)
-    balance_usd = user_wallets.get(user.id, 0.0)
+    # Get selected withdrawal coin
+    coin = context.user_data.get('withdrawal_coin', get_active_currency(user.id))
+    wallet = ensure_wallet_dict(user.id)
+    crypto_balance = wallet.get(coin, 0.0)
+    price = LIVE_PRICES.get(coin, 1.0)
+    balance_usd = crypto_balance * price
     
     try:
         if amount_str == 'all':
-            amount_in_currency = convert_currency(balance_usd, user_currency)
             amount_usd = balance_usd
         else:
-            amount_in_currency = float(amount_str)
-            amount_usd = convert_to_usd(amount_in_currency, user_currency)
+            amount_usd = float(amount_str)
     except ValueError:
         await update.message.reply_text(
             "❌ Invalid amount. Please enter a valid number or 'all'.",
@@ -16583,9 +16896,10 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
         return WITHDRAWAL_AMOUNT
     
     if amount_usd > balance_usd:
-        formatted_balance = format_currency(balance_usd, user_currency)
+        formatted = format_crypto_amount(crypto_balance, coin)
         await update.message.reply_text(
-            f"❌ Insufficient balance. Your balance is {formatted_balance}.",
+            f"❌ Insufficient {coin} balance.\n"
+            f"Your {coin} balance: {formatted} {coin} (${balance_usd:,.2f})",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="back_to_main")]])
         )
         return WITHDRAWAL_AMOUNT
@@ -16593,11 +16907,6 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
     # Check wager requirements
     total_wager_needed, breakdown = calculate_required_wager(user.id)
     if total_wager_needed > 0:
-        # Calculate remaining requirements in user's currency
-        tips_needed_display = format_currency(breakdown["unwagered_tips"], user_currency)
-        deposit_needed_display = format_currency(breakdown["unwagered_deposit"], user_currency)
-        total_wager_display = format_currency(total_wager_needed, user_currency)
-        
         rejection_msg = (
             f"❌ <b>Withdrawal Requirements Not Met</b>\n\n"
             f"Before you can withdraw, you must wager the following amounts on casino games:\n\n"
@@ -16605,19 +16914,18 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
         
         if breakdown["unwagered_tips"] > 0:
             rejection_msg += (
-                f"💸 <b>Tips Received:</b> {tips_needed_display}\n"
-                f"   Required wager: {tips_needed_display} (1x)\n\n"
+                f"💸 <b>Tips Received:</b> ${breakdown['unwagered_tips']:,.2f}\n"
+                f"   Required wager: ${breakdown['unwagered_tips']:,.2f} (1x)\n\n"
             )
         
         if breakdown["unwagered_deposit"] > 0:
-            deposit_wager_display = format_currency(breakdown["deposit_wager_needed"], user_currency)
             rejection_msg += (
-                f"💰 <b>Deposits:</b> {deposit_needed_display}\n"
-                f"   Required wager: {deposit_wager_display} (2x)\n\n"
+                f"💰 <b>Deposits:</b> ${breakdown['unwagered_deposit']:,.2f}\n"
+                f"   Required wager: ${breakdown['deposit_wager_needed']:,.2f} (2x)\n\n"
             )
         
         rejection_msg += (
-            f"📊 <b>Total Wager Needed:</b> {total_wager_display}\n\n"
+            f"📊 <b>Total Wager Needed:</b> ${total_wager_needed:,.2f}\n\n"
             f"<i>Play any casino game to meet these requirements.</i>"
         )
         
@@ -16627,6 +16935,10 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎮 Play Games", callback_data="main_games")]])
         )
         return ConversationHandler.END
+    
+    # Calculate crypto amount
+    crypto_amount = amount_usd / price
+    formatted_crypto = format_crypto_amount(crypto_amount, coin)
     
     # Generate unique withdrawal ID
     withdrawal_id = generate_unique_id("WD")
@@ -16638,41 +16950,43 @@ async def process_withdrawal_amount(update: Update, context: ContextTypes.DEFAUL
         "user_id": user.id,
         "username": user.username or f"User_{user.id}",
         "amount_usd": amount_usd,
-        "amount_currency": amount_in_currency,
-        "currency": user_currency,
+        "crypto_amount": crypto_amount,
+        "coin": coin,
         "withdrawal_address": withdrawal_address,
         "status": "pending",
         "timestamp": str(datetime.now(timezone.utc)),
         "txid": None
     }
     
-    # Deduct from user's balance
-    user_wallets[user.id] -= amount_usd
+    # Deduct from user's specific coin wallet
+    deduct_wallet(user.id, amount_usd, coin)
     save_user_data(user.id)
     
     # Notify user
-    formatted_amount = format_currency(amount_usd, user_currency)
     await update.message.reply_text(
         f"✅ <b>Withdrawal Request Submitted</b>\n\n"
         f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
-        f"<b>Amount:</b> {formatted_amount}\n"
+        f"<b>USD Value:</b> ${amount_usd:.2f}\n"
+        f"<b>Coin:</b> {coin}\n"
+        f"<b>Crypto Amount:</b> {formatted_crypto} {coin}\n"
         f"<b>Address:</b> <code>{withdrawal_address}</code>\n\n"
         f"Your withdrawal request is currently pending review by the administrator.\n"
         f"You will be notified once it's processed.",
         parse_mode=ParseMode.HTML
     )
     
-    # Forward to owner
-    currency_symbol = CURRENCY_SYMBOLS.get(user_currency, "$")
+    # Forward to owner with both USD and crypto amounts
     try:
         await context.bot.send_message(
             chat_id=BOT_OWNER_ID,
             text=(
-                f"💸 <b>New Withdrawal Request</b>\n\n"
+                f"📤 <b>Withdrawal Request</b>\n\n"
                 f"<b>Request ID:</b> <code>{withdrawal_id}</code>\n"
-                f"<b>User:</b> @{user.username or user.id} (ID: {user.id})\n"
-                f"<b>Amount (USD):</b> ${amount_usd:.2f}\n"
-                f"<b>Amount ({user_currency}):</b> {currency_symbol}{amount_in_currency:.2f}\n"
+                f"<b>User ID:</b> {user.id}\n"
+                f"<b>User:</b> @{user.username or user.id}\n"
+                f"<b>USD Value:</b> ${amount_usd:.2f}\n"
+                f"<b>Coin:</b> {coin}\n"
+                f"<b>Crypto Amount:</b> {formatted_crypto} {coin}\n"
                 f"<b>Address:</b> <code>{withdrawal_address}</code>\n"
                 f"<b>Status:</b> Pending"
             ),
@@ -16781,7 +17095,7 @@ async def withdrawal_cancel_callback(update: Update, context: ContextTypes.DEFAU
     # Return funds to user
     user_id = withdrawal["user_id"]
     amount_usd = withdrawal["amount_usd"]
-    user_wallets[user_id] = user_wallets.get(user_id, 0.0) + amount_usd
+    credit_wallet(user_id, amount_usd)
     save_user_data(user_id)
     
     # Update withdrawal status
@@ -16863,7 +17177,7 @@ async def recover_token_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Transfer data
     await ensure_user_in_wallets(new_user.id, new_user.username, context=context)
     user_stats[new_user.id] = user_stats[old_user_id]
-    user_wallets[new_user.id] = user_wallets[old_user_id]
+    user_wallets[new_user.id] = user_wallets.get(old_user_id, {"USDT": 0.0})
 
     user_stats[new_user.id]['userinfo']['user_id'] = new_user.id
     user_stats[new_user.id]['userinfo']['username'] = new_user.username
@@ -16894,7 +17208,7 @@ async def recover_token_step(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await update.message.reply_text(
         f"✅ <b>Recovery Successful!</b>\n\n"
-        f"Welcome back, {new_user.mention_html()}! Your data and balance of ${user_wallets[new_user.id]:.2f} have been restored. "
+        f"Welcome back, {new_user.mention_html()}! Your data and balance of ${get_total_balance_usd(new_user.id):,.2f} have been restored. "
         f"{active_games_transferred} active games were transferred to this account. Use /active to see them.",
         parse_mode=ParseMode.HTML
     )
@@ -17023,7 +17337,7 @@ async def claim_gift_code_command(update: Update, context: ContextTypes.DEFAULT_
         
     # All checks passed, award the user
     amount = code_data["amount"]
-    user_wallets[user.id] += amount
+    credit_wallet(user.id, amount)
     user_stats[user.id].setdefault("claimed_gift_codes", []).append(code)
     
     code_data["claims_left"] -= 1
@@ -17075,6 +17389,9 @@ async def post_init(application: Application):
     
     # Start the sweep task (if you want it running as well)
     application.create_task(sweep_deposits_task(application))
+    
+    # Start the live price engine (MEXC API, every 5 minutes)
+    application.create_task(update_live_prices())
     
     logging.info("Background tasks started successfully via post_init")
 # --- Main Function ---)
@@ -17496,7 +17813,10 @@ def main():
     )
 
     withdrawal_flow_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(main_menu_callback, pattern="^main_withdraw$")],
+        entry_points=[
+            CallbackQueryHandler(main_menu_callback, pattern="^main_withdraw$"),
+            CallbackQueryHandler(withdraw_coin_callback, pattern="^withdraw_coin_"),
+        ],
         states={
             WITHDRAWAL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_withdrawal_amount)]
         },
@@ -17602,7 +17922,18 @@ def main():
     app.add_handler(withdrawal_flow_handler)
     app.add_handler(withdrawal_approval_handler)
 
-    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^(main_|back_to_main|my_matches|my_deals|deposit_usdt_menu|deposit_coming_soon)"))
+    # BUG FIX: Register my_matches and my_deals handlers BEFORE the generic main_menu_callback
+    # to prevent regex conflicts with the 'main_' prefix pattern
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^my_matches_"))
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^my_deals_"))
+    
+    # Tip confirmation/cancellation handlers
+    app.add_handler(CallbackQueryHandler(tip_confirm_callback, pattern=r"^(confirm_tip_|cancel_tip_)"))
+    
+    # Withdrawal coin selection handler
+    app.add_handler(CallbackQueryHandler(withdraw_coin_callback, pattern=r"^withdraw_coin_"))
+
+    app.add_handler(CallbackQueryHandler(main_menu_callback, pattern=r"^(main_|back_to_main|deposit_usdt_menu|deposit_coming_soon)"))
     app.add_handler(CallbackQueryHandler(games_category_callback, pattern=r"^games_(category_|emoji_)")) # NEW - updated to handle emoji subcategories
     app.add_handler(CallbackQueryHandler(play_single_emoji_callback, pattern=r"^play_single_")) # NEW - Single emoji games
     app.add_handler(CallbackQueryHandler(group_challenge_mode_callback, pattern=r"^gc_mode_")) # NEW - Group challenge mode
@@ -17735,6 +18066,35 @@ def main():
         app.job_queue.run_repeating(check_and_send_bonus_notifications, interval=1800, first=60)
         logging.info("Scheduled bonus notification checker")
         
+        # Start live price engine as background task
+        async def _price_update_job(context):
+            """Wrapper to run price update once (job_queue handles repeating)."""
+            await _fetch_prices_once()
+        
+        async def _fetch_prices_once():
+            """Fetch live prices once from MEXC API."""
+            global LIVE_PRICES
+            symbols_map = {
+                "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL",
+                "TRXUSDT": "TRX", "LTCUSDT": "LTC", "BTCUSDT": "BTC",
+            }
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.get("https://api.mexc.com/api/v3/ticker/price")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        price_map = {item["symbol"]: float(item["price"]) for item in data}
+                        for api_sym, coin in symbols_map.items():
+                            if api_sym in price_map and price_map[api_sym] > 0:
+                                LIVE_PRICES[coin] = price_map[api_sym]
+                        LIVE_PRICES["USDT"] = 1.0
+                        logging.info(f"Live prices updated via job_queue")
+            except Exception as e:
+                logging.warning(f"Failed to fetch live prices: {e}")
+        
+        app.job_queue.run_repeating(_price_update_job, interval=300, first=5)  # Every 5 min
+        logging.info("Scheduled live price update task")
+        
         # ===== DEPOSIT SYSTEM BACKGROUND TASKS =====
         if deposit_system_active:
             logging.info("Starting deposit monitoring tasks...")
@@ -17812,7 +18172,7 @@ async def start_game_conversation_from_command(update: Update, context: ContextT
         try:
             bet_amount_str = context.args[0].lower()
             if bet_amount_str == 'all':
-                bet_amount = user_wallets.get(user.id, 0.0)
+                bet_amount = get_active_balance_usd(user.id)
             else:
                 bet_amount = float(bet_amount_str)
         except ValueError:
@@ -17824,7 +18184,7 @@ async def start_game_conversation_from_command(update: Update, context: ContextT
             return ConversationHandler.END
         
         # Check balance
-        if user_wallets.get(user.id, 0.0) < bet_amount:
+        if get_active_balance_usd(user.id) < bet_amount:
             await update.message.reply_text("❌ You don't have enough balance. Please enter a lower amount.")
             return ConversationHandler.END
         
@@ -17933,7 +18293,7 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
             user_stats[user.id]['game_sessions'].append(game_id)
             
-            user_wallets[user.id] -= bet_amount
+            deduct_wallet(user.id, bet_amount)
             save_user_data(user.id)
 
             initial_text = (
@@ -17965,7 +18325,7 @@ async def select_bet_amount_step(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text("Invalid amount. Please enter a valid number or 'all'.")
             return SELECT_BET_AMOUNT
         
-        if user_wallets.get(user.id, 0.0) < bet_amount_usd:
+        if get_active_balance_usd(user.id) < bet_amount_usd:
             await send_insufficient_balance_message(update)
             context.user_data.clear()
             return ConversationHandler.END
@@ -18005,7 +18365,7 @@ async def pvb_get_bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         bet_amount_str = update.message.text.lower()
         if bet_amount_str == 'all':
-            bet_amount = user_wallets.get(user.id, 0.0)
+            bet_amount = get_active_balance_usd(user.id)
         else:
             bet_amount = float(bet_amount_str)
     except ValueError:
@@ -18016,7 +18376,7 @@ async def pvb_get_bet_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not await check_bet_limits(update, bet_amount, f"pvb_{context.user_data['game_type']}"):
         return SELECT_BET_AMOUNT
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("Cancel", callback_data="cancel_game")]
         ])
@@ -18094,14 +18454,14 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
     
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
-    if user_wallets.get(user.id, 0.0) < bet_amount:
+    if get_active_balance_usd(user.id) < bet_amount:
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text="You no longer have enough balance for this bet. Game cancelled."
         )
         return
     
-    user_wallets[user.id] -= bet_amount
+    deduct_wallet(user.id, bet_amount)
     save_user_data(user.id)
 
     game_id = generate_unique_id("PVB")
@@ -18177,7 +18537,7 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
                 del context.chat_data[f"active_pvb_game_{user.id}"]
                 if user.id in active_pvb_games:
                     del active_pvb_games[user.id]
-                user_wallets[user.id] += bet_amount
+                credit_wallet(user.id, bet_amount)
                 update_pnl(user.id)
                 save_user_data(user.id)
                 return
@@ -18447,7 +18807,7 @@ async def weekly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TYP
     final_bonus = apply_username_bonus(adjusted_bonus, user.id)
     has_bonus = check_username_bonus(user.id)
     
-    user_wallets[user.id] += final_bonus
+    credit_wallet(user.id, final_bonus)
     stats["last_weekly_claim"] = str(now)
     # Reset weekly stats after claiming
     stats["weekly_stats"] = {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": str(now)}
@@ -18569,7 +18929,7 @@ async def monthly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TY
     final_bonus = apply_username_bonus(adjusted_bonus, user.id)
     has_bonus = check_username_bonus(user.id)
     
-    user_wallets[user.id] += final_bonus
+    credit_wallet(user.id, final_bonus)
     stats["last_monthly_claim"] = str(now)
     # Reset monthly stats after claiming
     stats["monthly_stats"] = {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": str(now)}
@@ -18670,14 +19030,14 @@ async def demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Give demo amount
     demo_amount = bot_settings.get("demo_amount", 10.0)
-    user_wallets[user.id] += demo_amount
+    credit_wallet(user.id, demo_amount)
     stats["last_demo_claim"] = str(datetime.now(timezone.utc))
     save_user_data(user.id)
     
     await update.message.reply_text(
         f"🎁 <b>Demo Claimed!</b>\n\n"
         f"You received <b>${demo_amount:.2f}</b>\n"
-        f"New balance: <b>${user_wallets[user.id]:.2f}</b>\n\n"
+        f"New balance: <b>${get_total_balance_usd(user.id):,.2f}</b>\n\n"
         f"💡 Try your luck with our games!",
         parse_mode=ParseMode.HTML
     )
@@ -19275,7 +19635,7 @@ async def rakeback_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     final_amount = apply_username_bonus(rakeback_balance, user.id)
     has_bonus = check_username_bonus(user.id)
     
-    user_wallets[user.id] += final_amount
+    credit_wallet(user.id, final_amount)
     stats["rakeback_balance"] = 0.0
     save_user_data(user.id)
     
