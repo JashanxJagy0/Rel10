@@ -508,13 +508,16 @@ def get_total_balance_usd(user_id: int) -> float:
 
 def deduct_wallet(user_id: int, usd_amount: float, coin: str = None):
     """Deduct crypto equivalent of USD amount from user's wallet.
-    Returns (crypto_amount, coin)."""
+    Returns (crypto_amount, coin). Allows negative balance if check was skipped."""
     wallet = ensure_wallet_dict(user_id)
     if coin is None:
         coin = get_active_currency(user_id)
     price = LIVE_PRICES.get(coin, 1.0)
     crypto_amount = usd_amount / price
-    wallet[coin] = wallet.get(coin, 0.0) - crypto_amount
+    current = wallet.get(coin, 0.0)
+    if current < crypto_amount:
+        logging.warning(f"Deduct wallet: user {user_id} has {current} {coin} but deducting {crypto_amount} {coin}")
+    wallet[coin] = current - crypto_amount
     return crypto_amount, coin
 
 
@@ -3846,7 +3849,14 @@ def load_all_user_data():
                     if isinstance(raw_wallet, (int, float)):
                         user_wallets[user_id] = {"USDT": float(raw_wallet)}
                     elif isinstance(raw_wallet, dict):
-                        user_wallets[user_id] = raw_wallet
+                        # Validate dict values are numeric
+                        clean_wallet = {}
+                        for k, v in raw_wallet.items():
+                            try:
+                                clean_wallet[k] = float(v)
+                            except (TypeError, ValueError):
+                                logging.warning(f"Invalid wallet value for user {user_id}, coin {k}: {v}")
+                        user_wallets[user_id] = clean_wallet if clean_wallet else {"USDT": 0.0}
                     else:
                         user_wallets[user_id] = {"USDT": 0.0}
                     # Migrate active_currency to user_stats
@@ -18068,11 +18078,7 @@ def main():
         
         # Start live price engine as background task
         async def _price_update_job(context):
-            """Wrapper to run price update once (job_queue handles repeating)."""
-            await _fetch_prices_once()
-        
-        async def _fetch_prices_once():
-            """Fetch live prices once from MEXC API."""
+            """Wrapper to run price update once via job_queue."""
             global LIVE_PRICES
             symbols_map = {
                 "ETHUSDT": "ETH", "BNBUSDT": "BNB", "SOLUSDT": "SOL",
